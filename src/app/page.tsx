@@ -757,7 +757,22 @@ export default function Home() {
                           ) : null}
 
                           <div className="min-w-0 flex-1">
-                            <div className="text-sm text-white/85">{it.title}</div>
+                            {it.type === "stop" && typeof it.lat === "number" && typeof it.lng === "number" ? (
+                              <a
+                                href={buildGoogleMapsToStopUrl({
+                                  origin: userLoc,
+                                  destination: { lat: it.lat, lng: it.lng },
+                                  travelMode: plan?.parkOnce ? "walking" : "driving",
+                                })}
+                                target="_blank"
+                                rel="noreferrer"
+                                className="text-sm font-semibold text-white/90 hover:underline decoration-white/30"
+                              >
+                                {it.title}
+                              </a>
+                            ) : (
+                              <div className="text-sm text-white/85">{it.title}</div>
+                            )}
                             {it.address ? <div className="mt-1 text-xs text-white/55">{it.address}</div> : null}
 
                             {it.type === "stop" ? (
