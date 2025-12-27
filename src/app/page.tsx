@@ -536,7 +536,20 @@ export default function Home() {
 
               {plan ? (
                 <div className="mt-4">
-                  <div className="grid gap-3">
+                  {showMap ? (
+                    mapsKey ? (
+                      <MapView apiKey={mapsKey} stops={mapStops} />
+                    ) : (
+                      <div className="rounded-2xl border border-amber-400/20 bg-amber-400/10 p-4 text-sm text-amber-100">
+                        Map view needs <span className="font-semibold">NEXT_PUBLIC_GOOGLE_MAPS_API_KEY</span> in your env.
+                        <div className="mt-1 text-xs text-amber-100/80">
+                          Add it to <code>.env.local</code> and Vercel env vars, then restart.
+                        </div>
+                      </div>
+                    )
+                  ) : null}
+
+                  <div className="mt-4 grid gap-3">
                     {plan.items.map((it, idx) => (
                       <div
                         key={idx}
@@ -635,19 +648,6 @@ export default function Home() {
                       </div>
                     ))}
                   </div>
-
-                  {showMap ? (
-                    mapsKey ? (
-                      <MapView apiKey={mapsKey} stops={mapStops} />
-                    ) : (
-                      <div className="mt-4 rounded-2xl border border-amber-400/20 bg-amber-400/10 p-4 text-sm text-amber-100">
-                        Map view needs <span className="font-semibold">NEXT_PUBLIC_GOOGLE_MAPS_API_KEY</span> in your env.
-                        <div className="mt-1 text-xs text-amber-100/80">
-                          Add it to <code>.env.local</code> and Vercel env vars, then restart.
-                        </div>
-                      </div>
-                    )
-                  ) : null}
                 </div>
               ) : (
                 <div className="mt-6 rounded-2xl border border-white/12 bg-black/20 p-6">
