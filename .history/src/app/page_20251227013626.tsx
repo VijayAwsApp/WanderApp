@@ -447,7 +447,7 @@ export default function Home() {
                                 </a>
                               ) : null}
                             </div>
-                          ) : null} 
+                          ) : null}
                         </div>
                       </div>
                     </div>
