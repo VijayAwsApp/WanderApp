@@ -1,0 +1,18 @@
+{
+    "sourceFile": "src/app/api/itinerary/route.ts",
+    "activeCommit": 0,
+    "commits": [
+        {
+            "activePatchIndex": 0,
+            "patches": [
+                {
+                    "date": 1766824749075,
+                    "content": "Index: \n===================================================================\n--- \n+++ \n"
+                }
+            ],
+            "date": 1766824749075,
+            "name": "Commit-0",
+            "content": "\n\nimport { NextResponse } from \"next/server\";\n\n// This route builds a 2–3 hour itinerary.\n// For now it returns a safe fallback plan.\n// You can later replace the body with Google Places + Routes logic.\n\nexport async function POST(req: Request) {\n  try {\n    const body = await req.json();\n    const destination = String(body?.destination ?? \"\").trim();\n    const totalMinutes = Number(body?.totalMinutes ?? 150);\n    const vibe = String(body?.vibe ?? \"culture\");\n\n    if (!destination) {\n      return NextResponse.json({ error: \"Destination is required\" }, { status: 400 });\n    }\n\n    const minutes = clamp(totalMinutes, 120, 180);\n\n    // Simple 2–3 hour structure\n    const stopCount = minutes <= 140 ? 2 : 3;\n    const travelMinEach = 12;\n    const travelTotal = (stopCount - 1) * travelMinEach;\n    const remaining = Math.max(60, minutes - travelTotal);\n\n    const stopDurations =\n      stopCount === 2\n        ? [Math.floor(remaining * 0.55), remaining - Math.floor(remaining * 0.55)]\n        : [\n            Math.floor(remaining * 0.42),\n            Math.floor(remaining * 0.35),\n            remaining - Math.floor(remaining * 0.42) - Math.floor(remaining * 0.35),\n          ];\n\n    const byVibe: Record<string, string[]> = {\n      relaxed: [\"Waterfront stroll\", \"Coffee break\", \"Scenic viewpoint\"],\n      foodie: [\"Top-rated café\", \"Local specialty\", \"Dessert stop\"],\n      adventure: [\"Easy trail\", \"Lookout point\", \"Recovery café\"],\n      culture: [\"Museum or gallery\", \"Historic walk\", \"Local landmark\"],\n    };\n\n    const titles = byVibe[vibe] ?? byVibe.culture;\n\n    const items: Array<{\n      type: \"stop\" | \"travel\";\n      title: string;\n      durationMin: number;\n    }> = [];\n\n    for (let i = 0; i < stopCount; i++) {\n      items.push({\n        type: \"stop\",\n        title: `${titles[i] ?? \"Stop\"} in ${destination}`,\n        durationMin: Math.max(25, stopDurations[i]),\n      });\n\n      if (i < stopCount - 1) {\n        items.push({\n          type: \"travel\",\n          title: \"Walk to next stop\",\n          durationMin: travelMinEach,\n        });\n      }\n    }\n\n    return NextResponse.json({\n      destination,\n      totalMinutes: minutes,\n      vibe,\n      items,\n    });\n  } catch (err) {\n    return NextResponse.json(\n      { error: \"Failed to generate itinerary\" },\n      { status: 500 }\n    );\n  }\n}\n\nfunction clamp(n: number, min: number, max: number) {\n  if (!Number.isFinite(n)) return min;\n  return Math.max(min, Math.min(max, n));\n}"
+        }
+    ]
+}
