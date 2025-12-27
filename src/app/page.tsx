@@ -1,7 +1,6 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
-
 import Script from "next/script";
 
 type PlanItem = {
@@ -34,6 +33,8 @@ type PlanResponse = {
   totalMinutes: number;
   vibe: string;
   parkOnce?: boolean;
+  riderMode?: boolean;
+  bufferMinutes?: number;
   items: PlanItem[];
 };
 
@@ -51,7 +52,6 @@ const TRAVEL_STYLES = [
 type TravelStyleKey = (typeof TRAVEL_STYLES)[number]["key"];
 
 function formatPriceLevel(priceLevel?: string) {
-  // Typical values: PRICE_LEVEL_FREE, PRICE_LEVEL_INEXPENSIVE, ...
   if (!priceLevel) return undefined;
   if (priceLevel.includes("FREE")) return "Free";
   if (priceLevel.includes("INEXPENSIVE")) return "$";
@@ -113,8 +113,6 @@ function buildGoogleMapsToStopUrl(args: {
 }
 
 function estimateCostRange(items: PlanItem[]) {
-  // very rough per-stop estimates (USD)
-  // Free: 0-0, $: 10-25, $$: 25-60, $$$: 60-120, $$$$: 120-250
   const stopItems = items.filter((x) => x.type === "stop");
   if (stopItems.length === 0) return null;
 
@@ -139,13 +137,11 @@ function estimateCostRange(items: PlanItem[]) {
       min += 120;
       max += 250;
     } else {
-      // unknown: assume low-to-mid
       min += 10;
       max += 60;
     }
   }
 
-  // Add small buffer for transport/parking etc.
   min += 5;
   max += 20;
 
@@ -220,7 +216,8 @@ function MapView({
   const directionsRef = useRef<any>(null);
   const [loaded, setLoaded] = useState(false);
 
-  const ready = loaded && typeof window !== "undefined" && (window as any).google?.maps;
+  const ready =
+    loaded && typeof window !== "undefined" && (window as any).google?.maps;
 
   useEffect(() => {
     if (!ready) return;
@@ -228,7 +225,9 @@ function MapView({
     if (mapRef.current) return;
 
     const first = stops?.[0];
-    const center = first ? { lat: first.lat, lng: first.lng } : { lat: 49.2827, lng: -123.1207 };
+    const center = first
+      ? { lat: first.lat, lng: first.lng }
+      : { lat: 49.2827, lng: -123.1207 };
 
     const g = (window as any).google;
     mapRef.current = new g.maps.Map(mapDivRef.current, {
@@ -238,7 +237,7 @@ function MapView({
       fullscreenControl: false,
       streetViewControl: false,
     });
-  }, [loaded, ready, stops, origin]);
+  }, [loaded, ready, stops]);
 
   useEffect(() => {
     if (!ready) return;
@@ -272,10 +271,12 @@ function MapView({
       });
 
       const info = new g.maps.InfoWindow({
-        content: `<div style=\"font-size:13px; font-weight:600; padding:2px 0;\">${s.title}</div>`,
+        content: `<div style="font-size:13px; font-weight:600; padding:2px 0;">${s.title}</div>`,
       });
 
-      marker.addListener("click", () => info.open({ map: mapRef.current!, anchor: marker }));
+      marker.addListener("click", () =>
+        info.open({ map: mapRef.current!, anchor: marker })
+      );
 
       markersRef.current.push(marker);
     });
@@ -285,12 +286,19 @@ function MapView({
 
   useEffect(() => {
     if (!ready || !mapRef.current) return;
-    if (!origin || origin.lat == null || origin.lng == null) return;
     if (!stops || stops.length === 0) return;
 
     const g = (window as any).google;
 
-    // Clean up any previous renderer
+    const ptsAll = stops.map((s) => ({ lat: s.lat, lng: s.lng }));
+    const originPt =
+      origin && origin.lat != null && origin.lng != null
+        ? { lat: origin.lat, lng: origin.lng }
+        : ptsAll[0];
+    const pts =
+      origin && origin.lat != null && origin.lng != null ? ptsAll : ptsAll.slice(1);
+    if (pts.length === 0) return;
+
     if (directionsRef.current) {
       try {
         directionsRef.current.setMap(null);
@@ -307,15 +315,17 @@ function MapView({
     dr.setMap(mapRef.current);
     directionsRef.current = dr;
 
-    const mode = travelMode === "WALKING" ? g.maps.TravelMode.WALKING : g.maps.TravelMode.DRIVING;
+    const mode =
+      travelMode === "WALKING"
+        ? g.maps.TravelMode.WALKING
+        : g.maps.TravelMode.DRIVING;
 
-    const pts = stops.map((s) => ({ lat: s.lat, lng: s.lng }));
     const destination = pts[pts.length - 1];
     const waypoints = pts.slice(0, -1).map((p) => ({ location: p, stopover: true }));
 
     ds.route(
       {
-        origin: { lat: origin.lat, lng: origin.lng },
+        origin: originPt,
         destination,
         waypoints,
         travelMode: mode,
@@ -339,7 +349,10 @@ function MapView({
     <div className="mt-4 overflow-hidden rounded-2xl border border-white/10 bg-black/20">
       <div className="flex items-center justify-between border-b border-white/10 px-4 py-3">
         <div className="text-sm font-semibold text-white/85">Map</div>
-        <div className="text-xs text-white/55">Stops: {stops.length}{origin ? " + you" : ""}</div>
+        <div className="text-xs text-white/55">
+          Stops: {stops.length}
+          {origin ? " + you" : ""}
+        </div>
       </div>
       {!ready ? (
         <div className="flex h-[360px] w-full items-center justify-center text-sm text-white/55">
@@ -368,6 +381,9 @@ export default function Home() {
   const [loading, setLoading] = useState(false);
 
   const [parkOnce, setParkOnce] = useState(false);
+  const [riderMode, setRiderMode] = useState(false);
+  const [addBuffer, setAddBuffer] = useState(false);
+
   const [showMap, setShowMap] = useState(true);
   const [userLoc, setUserLoc] = useState<{ lat: number; lng: number } | null>(null);
   const [locError, setLocError] = useState<string | null>(null);
@@ -377,14 +393,18 @@ export default function Home() {
   const mapStops = useMemo(() => {
     if (!plan) return [] as { title: string; lat: number; lng: number }[];
     return plan.items
-      .filter((it) => it.type === "stop" && typeof it.lat === "number" && typeof it.lng === "number")
+      .filter(
+        (it) => it.type === "stop" && typeof it.lat === "number" && typeof it.lng === "number"
+      )
       .map((it) => ({ title: it.title, lat: it.lat as number, lng: it.lng as number }));
   }, [plan]);
 
   const routeStops = useMemo(() => {
     if (!plan) return [] as { lat: number; lng: number }[];
     return plan.items
-      .filter((it) => it.type === "stop" && typeof it.lat === "number" && typeof it.lng === "number")
+      .filter(
+        (it) => it.type === "stop" && typeof it.lat === "number" && typeof it.lng === "number"
+      )
       .map((it) => ({ lat: it.lat as number, lng: it.lng as number }));
   }, [plan]);
 
@@ -425,11 +445,17 @@ export default function Home() {
     setLoading(true);
 
     try {
-      // ✅ This was missing before: call your API route
       const res = await fetch("/api/itinerary", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ destination: dest, totalMinutes: duration, vibe: style, parkOnce }),
+        body: JSON.stringify({
+          destination: dest,
+          totalMinutes: duration,
+          vibe: style,
+          parkOnce,
+          riderMode,
+          bufferMinutes: addBuffer ? 10 : 0,
+        }),
       });
 
       if (!res.ok) {
@@ -456,7 +482,6 @@ export default function Home() {
     setError(null);
     setPlan(null);
 
-    // run after state updates
     setTimeout(() => {
       void onGenerate();
     }, 0);
@@ -493,7 +518,10 @@ export default function Home() {
             >
               Quick demo
             </button>
-            <button className="rounded-xl bg-white px-3 py-2 text-sm font-semibold text-black transition hover:bg-white/90" type="button">
+            <button
+              className="rounded-xl bg-white px-3 py-2 text-sm font-semibold text-black transition hover:bg-white/90"
+              type="button"
+            >
               Sign in
             </button>
           </div>
@@ -511,8 +539,11 @@ export default function Home() {
 
             <h1 className="mt-4 text-4xl font-semibold tracking-tight sm:text-5xl">
               Build a
-              <span className="bg-gradient-to-r from-fuchsia-300 via-sky-300 to-emerald-200 bg-clip-text text-transparent"> 2–3 hour</span>
-              {" "}itinerary
+              <span className="bg-gradient-to-r from-fuchsia-300 via-sky-300 to-emerald-200 bg-clip-text text-transparent">
+                {" "}
+                2–3 hour
+              </span>{" "}
+              itinerary
             </h1>
             <p className="mt-4 max-w-xl text-base text-white/70">
               Pick a destination, duration, and vibe. We’ll generate a tight plan you can actually follow.
@@ -583,21 +614,55 @@ export default function Home() {
                 </div>
               </div>
 
-            <div className="mt-3 flex flex-wrap items-center gap-2">
-              <button
-                type="button"
-                onClick={() => setParkOnce((v) => !v)}
-                className={
-                  "rounded-full px-3 py-1.5 text-sm transition " +
-                  (parkOnce
-                    ? "bg-white text-black"
-                    : "border border-white/15 bg-white/5 text-white/85 hover:bg-white/10")
-                }
-              >
-                {parkOnce ? "Park once: ON" : "Park once"}
-              </button>
-              <div className="text-xs text-white/55">Park near the first stop, then walk between stops.</div>
-            </div>
+              <div className="mt-4 flex flex-col gap-2">
+                <button
+                  type="button"
+                  onClick={() => setParkOnce((v) => !v)}
+                  className={
+                    "self-start rounded-full px-3 py-1.5 text-sm transition " +
+                    (parkOnce
+                      ? "bg-white text-black"
+                      : "border border-white/15 bg-white/5 text-white/85 hover:bg-white/10")
+                  }
+                >
+                  {parkOnce ? "Park once: ON" : "Park once"}
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => setRiderMode((v) => !v)}
+                  className={
+                    "self-start rounded-full px-3 py-1.5 text-sm transition " +
+                    (riderMode
+                      ? "bg-white text-black"
+                      : "border border-white/15 bg-white/5 text-white/85 hover:bg-white/10")
+                  }
+                >
+                  {riderMode ? "Rider mode: ON" : "Rider mode"}
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => setAddBuffer((v) => !v)}
+                  className={
+                    "self-start rounded-full px-3 py-1.5 text-sm transition " +
+                    (addBuffer
+                      ? "bg-white text-black"
+                      : "border border-white/15 bg-white/5 text-white/85 hover:bg-white/10")
+                  }
+                >
+                  {addBuffer ? "Buffer: +10 min" : "Add buffer"}
+                </button>
+
+                <div className="text-xs text-white/55">
+                  {parkOnce ? "Park near the first stop, then walk between stops. " : ""}
+                  {riderMode ? "More scenic stops, easier pull-ins, loop-friendly ordering. " : ""}
+                  {addBuffer ? "Adds +10 min buffer to each travel leg for parking/traffic." : ""}
+                  {!parkOnce && !riderMode && !addBuffer
+                    ? "Optional: Park once for walkable clusters, Rider mode for scenic stops, and Buffer for realism."
+                    : null}
+                </div>
+              </div>
 
               <div className="mt-4 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
                 <div className="text-sm">
@@ -662,7 +727,9 @@ export default function Home() {
                     </div>
                   </div>
 
-                  {locError ? <div className="mt-2 text-xs text-rose-200/90">{locError}</div> : null}
+                  {locError ? (
+                    <div className="mt-2 text-xs text-rose-200/90">{locError}</div>
+                  ) : null}
 
                   {showMap ? (
                     mapsKey ? (
@@ -674,7 +741,8 @@ export default function Home() {
                       />
                     ) : (
                       <div className="mt-3 rounded-2xl border border-amber-400/20 bg-amber-400/10 p-4 text-sm text-amber-100">
-                        Map view needs <span className="font-semibold">NEXT_PUBLIC_GOOGLE_MAPS_API_KEY</span> in your env.
+                        Map view needs{" "}
+                        <span className="font-semibold">NEXT_PUBLIC_GOOGLE_MAPS_API_KEY</span> in your env.
                         <div className="mt-1 text-xs text-amber-100/80">
                           Add it to <code>.env.local</code> and Vercel env vars, then restart.
                         </div>
@@ -685,7 +753,7 @@ export default function Home() {
               ) : null}
             </div>
 
-            {/* preview (moved below planner) */}
+            {/* preview */}
             <div className="mt-8">
               <div className="rounded-3xl border border-white/12 bg-white/5 p-5 shadow-[0_0_0_1px_rgba(255,255,255,0.06)] backdrop-blur">
                 <div className="flex items-start justify-between gap-3">
@@ -695,9 +763,17 @@ export default function Home() {
                     <div className="mt-1 text-sm text-white/60">
                       {plan ? (
                         <>
-                          {plan.destination || "—"} • {plan.totalMinutes} min • {TRAVEL_STYLES.find((s) => s.key === style)?.label}
+                          {plan.destination || "—"} • {plan.totalMinutes} min •{" "}
+                          {TRAVEL_STYLES.find((s) => s.key === style)?.label}
                           {plan.items?.some(
-                            (x) => x.type === "stop" && (x.photoUrl || x.rating || x.priceLevel || x.openNow !== undefined || x.reviewSnippet || x.parking)
+                            (x) =>
+                              x.type === "stop" &&
+                              (x.photoUrl ||
+                                x.rating ||
+                                x.priceLevel ||
+                                x.openNow !== undefined ||
+                                x.reviewSnippet ||
+                                x.parking)
                           ) ? (
                             <span className="ml-2 rounded-full border border-emerald-400/30 bg-emerald-400/10 px-2 py-0.5 text-xs text-emerald-200">
                               Enriched
@@ -707,6 +783,19 @@ export default function Home() {
                               Basic
                             </span>
                           )}
+
+                          {riderMode ? (
+                            <span className="ml-2 rounded-full border border-sky-400/30 bg-sky-400/10 px-2 py-0.5 text-xs text-sky-200">
+                              Rider Mode
+                            </span>
+                          ) : null}
+
+                          {plan?.bufferMinutes ? (
+                            <span className="ml-2 rounded-full border border-white/15 bg-white/5 px-2 py-0.5 text-xs text-white/80">
+                              Buffer +{plan.bufferMinutes}m/leg
+                            </span>
+                          ) : null}
+
                           {cost ? (
                             <span className="ml-2 rounded-full border border-white/15 bg-white/5 px-2 py-0.5 text-xs text-white/80">
                               Est. ${cost.min}–${cost.max}
@@ -735,12 +824,18 @@ export default function Home() {
                         key={idx}
                         className={
                           "rounded-2xl border border-white/12 p-4 transition " +
-                          (it.type === "stop" ? "bg-black/20 hover:bg-black/25" : "bg-white/5 hover:bg-white/10")
+                          (it.type === "stop"
+                            ? "bg-black/20 hover:bg-black/25"
+                            : "bg-white/5 hover:bg-white/10")
                         }
                       >
                         <div className="flex items-center justify-between gap-3">
                           <div className="text-sm font-semibold">
-                            {it.type === "stop" ? "Stop" : it.mode === "WALK" ? "Walk" : "Drive"}
+                            {it.type === "stop"
+                              ? "Stop"
+                              : it.mode === "WALK"
+                              ? "Walk"
+                              : "Drive"}
                           </div>
                           <div className="text-xs text-white/55">{it.durationMin} min</div>
                         </div>
@@ -757,7 +852,9 @@ export default function Home() {
                           ) : null}
 
                           <div className="min-w-0 flex-1">
-                            {it.type === "stop" && typeof it.lat === "number" && typeof it.lng === "number" ? (
+                            {it.type === "stop" &&
+                            typeof it.lat === "number" &&
+                            typeof it.lng === "number" ? (
                               <a
                                 href={buildGoogleMapsToStopUrl({
                                   origin: userLoc,
@@ -773,7 +870,10 @@ export default function Home() {
                             ) : (
                               <div className="text-sm text-white/85">{it.title}</div>
                             )}
-                            {it.address ? <div className="mt-1 text-xs text-white/55">{it.address}</div> : null}
+
+                            {it.address ? (
+                              <div className="mt-1 text-xs text-white/55">{it.address}</div>
+                            ) : null}
 
                             {it.type === "stop" ? (
                               <div className="mt-2 flex flex-wrap items-center gap-2 text-xs">
@@ -856,47 +956,26 @@ export default function Home() {
                   </div>
                 )}
               </div>
-
-              <div className="mt-4 grid gap-3 sm:grid-cols-2">
-                <div className="rounded-2xl border border-white/12 bg-white/5 p-4">
-                  <div className="text-sm font-semibold">How it works</div>
-                  <div className="mt-2 space-y-2 text-sm text-white/70">
-                    <div className="flex gap-2">
-                      <span className="grid h-6 w-6 place-items-center rounded-lg bg-white/10 text-xs ring-1 ring-white/10">1</span>
-                      <span>Destination + duration</span>
-                    </div>
-                    <div className="flex gap-2">
-                      <span className="grid h-6 w-6 place-items-center rounded-lg bg-white/10 text-xs ring-1 ring-white/10">2</span>
-                      <span>Pick your vibe</span>
-                    </div>
-                    <div className="flex gap-2">
-                      <span className="grid h-6 w-6 place-items-center rounded-lg bg-white/10 text-xs ring-1 ring-white/10">3</span>
-                      <span>Generate a 2–3 hour plan</span>
-                    </div>
-                  </div>
-                </div>
-                <div className="rounded-2xl border border-white/12 bg-white/5 p-4">
-                  <div className="text-sm font-semibold">Tips</div>
-                  <div className="mt-2 space-y-1 text-sm text-white/70">
-                    <div>• Use Park once for walkable areas.</div>
-                    <div>• Tap Maps to open directions.</div>
-                    <div>• Toggle Map to see pins.</div>
-                  </div>
-                </div>
-              </div>
             </div>
-
           </div>
         </div>
       </section>
 
       <footer className="mx-auto max-w-6xl px-4 pb-10 pt-2 text-sm text-white/45">
         <div className="flex flex-col gap-2 border-t border-white/10 pt-6 sm:flex-row sm:items-center sm:justify-between">
-          <div>© {new Date().getFullYear()} {APP_NAME}</div>
+          <div>
+            © {new Date().getFullYear()} {APP_NAME}
+          </div>
           <div className="flex gap-4">
-            <button className="hover:text-white/70" type="button">Privacy</button>
-            <button className="hover:text-white/70" type="button">Terms</button>
-            <button className="hover:text-white/70" type="button">Contact</button>
+            <button className="hover:text-white/70" type="button">
+              Privacy
+            </button>
+            <button className="hover:text-white/70" type="button">
+              Terms
+            </button>
+            <button className="hover:text-white/70" type="button">
+              Contact
+            </button>
           </div>
         </div>
       </footer>

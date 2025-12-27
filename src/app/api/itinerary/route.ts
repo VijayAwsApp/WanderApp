@@ -46,7 +46,6 @@ function clamp(n: number, min: number, max: number) {
 }
 
 function toMinsFromDuration(durationStr: string): number {
-  // e.g. "1234s"
   const secs = Number(String(durationStr ?? "").replace("s", "")) || 900;
   return Math.max(5, Math.round(secs / 60));
 }
@@ -76,7 +75,6 @@ function pickCategory(types: any): "food" | "park" | "attraction" {
   const t = Array.isArray(types) ? (types as string[]) : [];
   const has = (k: string) => t.includes(k);
 
-  // Food / coffee
   if (
     has("restaurant") ||
     has("cafe") ||
@@ -88,7 +86,6 @@ function pickCategory(types: any): "food" | "park" | "attraction" {
     return "food";
   }
 
-  // Parks / outdoor
   if (
     has("park") ||
     has("natural_feature") ||
@@ -135,7 +132,6 @@ function isNoisyType(types: any) {
     "hospital",
   ]);
 
-  // If it contains ONLY bad types, reject.
   const nonBad = t.filter((x) => !bad.has(x));
   if (nonBad.length === 0 && t.length > 0) return true;
 
@@ -146,14 +142,11 @@ function scoreCandidate(p: any, riderMode?: boolean) {
   const rating = typeof p?.rating === "number" ? p.rating : 0;
   const count = typeof p?.userRatingCount === "number" ? p.userRatingCount : 0;
 
-  // Prefer well-rated, well-reviewed places.
   const score = rating * 12 + Math.log10(Math.max(1, count)) * 8;
 
-  // Small category boosts
   const cat = pickCategory(p?.types);
   const boost = cat === "attraction" ? 1.12 : cat === "park" ? 1.08 : 1.0;
 
-  // Rider Mode: boost scenic/outdoors + one good food/coffee stop
   if (riderMode) {
     const t = Array.isArray(p?.types) ? (p.types as string[]) : [];
     const scenicBoostTypes = new Set([
@@ -177,14 +170,12 @@ function scoreCandidate(p: any, riderMode?: boolean) {
 }
 
 function desiredCategories(vibe: string, stopCount: number): ("attraction" | "food" | "park")[] {
-  // 2 stops: always include an anchor + a food/coffee stop
   if (stopCount === 2) return vibe === "foodie" ? ["food", "attraction"] : ["attraction", "food"];
 
-  // 3 stops: vary the order by vibe
   if (vibe === "adventure") return ["park", "attraction", "food"];
   if (vibe === "relaxed") return ["park", "food", "attraction"];
   if (vibe === "foodie") return ["food", "attraction", "park"];
-  return ["attraction", "food", "park"]; // culture/default
+  return ["attraction", "food", "park"];
 }
 
 function orderByNearestNeighbor(list: any[], riderMode?: boolean) {
@@ -192,7 +183,6 @@ function orderByNearestNeighbor(list: any[], riderMode?: boolean) {
   const remaining = [...list];
   const ordered: any[] = [];
 
-  // Start with the best-scoring item.
   remaining.sort((a, b) => scoreCandidate(b, riderMode) - scoreCandidate(a, riderMode));
   ordered.push(remaining.shift());
 
@@ -228,7 +218,6 @@ async function googleFetch(url: string, opts: RequestInit & { fieldMask?: string
     "X-Goog-Api-Key": key,
     ...(rest.headers as Record<string, string> | undefined),
   };
-  // Places API (New) requires FieldMask for response fields
   if (fieldMask) headers["X-Goog-FieldMask"] = fieldMask;
 
   return fetch(url, { ...rest, headers });
@@ -261,7 +250,6 @@ async function getPlaceDetails(key: string, placeId: string) {
 }
 
 async function getPhotoUri(key: string, photoName: string, maxWidthPx = 900) {
-  // /v1/{name}/media?maxWidthPx=...&skipHttpRedirect=true
   const url = `https://places.googleapis.com/v1/${photoName}/media?maxWidthPx=${maxWidthPx}&skipHttpRedirect=true`;
   const res = await googleFetch(url, { key, method: "GET", fieldMask: "photoUri" });
   if (!res.ok) return undefined;
@@ -306,7 +294,6 @@ async function findParkingNear(key: string, placeTitle: string, destinationLabel
     address: best?.formattedAddress,
     lat: typeof loc?.latitude === "number" ? loc.latitude : undefined,
     lng: typeof loc?.longitude === "number" ? loc.longitude : undefined,
-    // mapsUri is NOT available from places:searchText results
   } as ParkingOption;
 }
 
@@ -349,6 +336,7 @@ export async function POST(req: Request) {
     const vibe = String(body?.vibe ?? "culture");
     const parkOnce = Boolean(body?.parkOnce);
     const riderMode = Boolean(body?.riderMode);
+    const bufferMinutes = clamp(Number(body?.bufferMinutes ?? 0), 0, 20);
 
     if (!destination) {
       return NextResponse.json({ error: "Destination is required" }, { status: 400 });
@@ -371,12 +359,9 @@ export async function POST(req: Request) {
         ? `waterfront parks cafes in ${destination}`
         : `top tourist attractions museums in ${destination}`;
 
-    // Get a reasonable "center" for the destination (first result is usually the city/area).
     const destPlaces = await searchPlacesText(key, destination, 3);
     const destCenter = destPlaces?.[0]?.location as { latitude: number; longitude: number } | undefined;
 
-    // Pull a larger pool so we can filter and pick better stops.
-    // Use multiple queries to increase variety.
     const qAttraction = `top attractions museums landmarks in ${destination}`;
     const qFood = `best cafes restaurants bakeries in ${destination}`;
     const qPark = `best parks viewpoints waterfront in ${destination}`;
@@ -392,7 +377,6 @@ export async function POST(req: Request) {
       searchPlacesText(key, riderMode ? qRideCoffee : qFood, 20),
     ]);
 
-    // Deduplicate by place id
     const byId = new Map<string, any>();
     for (const p of [...candA, ...candF, ...candP, ...candVibe, ...candScenic, ...candRideCoffee]) {
       if (p?.id && !byId.has(p.id)) byId.set(p.id, p);
@@ -400,7 +384,7 @@ export async function POST(req: Request) {
     const pooled = Array.from(byId.values());
 
     const stopCount = pickStopCount(totalMinutes);
-    const radiusKm = 10; // keeps results local for city/area searches
+    const radiusKm = 10;
 
     const filtered = pooled
       .filter((p) => p?.id && p?.location?.latitude != null && p?.location?.longitude != null)
@@ -409,7 +393,6 @@ export async function POST(req: Request) {
         const rating = typeof p?.rating === "number" ? p.rating : 0;
         const count = typeof p?.userRatingCount === "number" ? p.userRatingCount : 0;
 
-        // baseline quality: if it has reviews, enforce a decent rating
         if (count >= 20 && rating > 0 && rating < 4.1) return false;
         if (count >= 5 && rating > 0 && rating < 3.9) return false;
 
@@ -425,24 +408,19 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: "Not enough high-quality places found" }, { status: 404 });
     }
 
-    // Diversity selection: attraction + food + park (order varies by vibe)
     const want = desiredCategories(vibe, stopCount);
 
-    // If Park Once is enabled, prefer a tight cluster around the first (anchor) stop.
-    // For walkable clusters, ~1.5km is a good starting point; relax to 3km if needed.
     const walkKmPrimary = 1.5;
     const walkKmRelaxed = 3;
 
     const picked: any[] = [];
 
-    // 1) Pick an anchor (first desired category) from overall filtered pool.
     const anchorCat = want[0];
     const anchor = filtered.find((p) => pickCategory(p?.types) === anchorCat) || filtered[0];
     if (anchor) picked.push(anchor);
 
     const anchorLoc = anchor?.location as { latitude: number; longitude: number } | undefined;
 
-    // 2) Build a pool for subsequent picks.
     const poolPrimary =
       parkOnce && anchorLoc
         ? filtered.filter((p) => {
@@ -464,7 +442,6 @@ export async function POST(req: Request) {
     const pickFromPool = (pool: any[], cat: "attraction" | "food" | "park") =>
       pool.find((p) => pickCategory(p?.types) === cat && !picked.some((x) => x.id === p.id));
 
-    // 3) Fill remaining desired categories, preferring the tight pool.
     for (const cat of want.slice(1)) {
       let next = pickFromPool(poolPrimary, cat);
       if (!next) next = pickFromPool(poolRelaxed, cat);
@@ -472,7 +449,6 @@ export async function POST(req: Request) {
       if (next) picked.push(next);
     }
 
-    // 4) If still short, fill from tight pool first, then relaxed, then overall.
     const fillFrom = (pool: any[]) => {
       while (picked.length < stopCount) {
         const next = pool.find((p) => !picked.some((x) => x.id === p.id));
@@ -485,14 +461,10 @@ export async function POST(req: Request) {
     fillFrom(poolRelaxed);
     fillFrom(filtered);
 
-    // Ordering:
-    // - If Park Once: keep the anchor first then order rest by nearest-neighbor for minimal walking.
-    // - Else: nearest-neighbor for minimal driving.
     let ordered = parkOnce
       ? [picked[0], ...orderByNearestNeighbor(picked.slice(1), riderMode)]
       : orderByNearestNeighbor(picked, riderMode);
 
-    // Rider mode: prefer a loose loop by ending near the anchor.
     if (riderMode && ordered.length >= 3 && anchorLoc) {
       const rest = ordered.slice(1);
       rest.sort((a, b) => {
@@ -519,23 +491,19 @@ export async function POST(req: Request) {
 
         const details = await getPlaceDetails(key, placeId);
 
-        // Photo
         let photoUrl: string | undefined;
         const firstPhotoName = details?.photos?.[0]?.name;
         if (firstPhotoName) {
           photoUrl = await getPhotoUri(key, firstPhotoName, 1000);
         }
 
-        // Reviews
         const reviewSnippet = safeText(details?.reviews?.[0]?.text?.text, 170);
 
-        // Opening hours
         const openNow = details?.regularOpeningHours?.openNow;
         const weekdayText = Array.isArray(details?.regularOpeningHours?.weekdayDescriptions)
           ? (details.regularOpeningHours.weekdayDescriptions as string[])
           : undefined;
 
-        // Parking near each stop (best effort)
         let parking: ParkingOption | undefined;
         try {
           const base = await findParkingNear(key, details?.displayName?.text ?? "", destination);
@@ -565,7 +533,6 @@ export async function POST(req: Request) {
       })
     );
 
-    // Optional: Park once near first stop, then walk between stops
     let parkOnceLocation: ParkingOption | undefined;
     if (parkOnce && stops.length > 0) {
       try {
@@ -578,7 +545,6 @@ export async function POST(req: Request) {
 
     const travelMins: number[] = [];
 
-    // If parkOnce, add a first travel leg from parking -> first stop (WALK) and then walk between stops.
     if (parkOnce && parkOnceLocation?.lat != null && parkOnceLocation?.lng != null && stops.length > 0) {
       const firstStop = stops[0];
       const fromParkingToFirst = await computeRouteMinutes(
@@ -587,7 +553,7 @@ export async function POST(req: Request) {
         { latitude: firstStop.lat, longitude: firstStop.lng },
         "WALK"
       );
-      travelMins.push(fromParkingToFirst);
+      travelMins.push(fromParkingToFirst + bufferMinutes);
 
       for (let i = 0; i < stops.length - 1; i++) {
         const a = stops[i];
@@ -598,10 +564,9 @@ export async function POST(req: Request) {
           { latitude: b.lat, longitude: b.lng },
           "WALK"
         );
-        travelMins.push(mins);
+        travelMins.push(mins + bufferMinutes);
       }
     } else {
-      // Default: DRIVE between stops
       for (let i = 0; i < stops.length - 1; i++) {
         const a = stops[i];
         const b = stops[i + 1];
@@ -611,7 +576,7 @@ export async function POST(req: Request) {
           { latitude: b.lat, longitude: b.lng },
           "DRIVE"
         );
-        travelMins.push(mins);
+        travelMins.push(mins + bufferMinutes);
       }
     }
 
@@ -621,7 +586,6 @@ export async function POST(req: Request) {
     const items: PlanItem[] = [];
 
     if (parkOnce && parkOnceLocation?.lat != null && parkOnceLocation?.lng != null) {
-      // Add a parking stop card first (5 min buffer)
       items.push({
         type: "stop",
         durationMin: 5,
@@ -648,11 +612,10 @@ export async function POST(req: Request) {
         },
       });
 
-      // Travel leg from parking -> first stop (WALK) is travelMins[0]
       if (travelMins.length > 0) {
         items.push({
           type: "travel",
-          title: "Walk to first stop",
+          title: `Walk to ${stops[0]?.title ?? "first stop"}`,
           durationMin: travelMins[0],
           mode: "WALK",
         });
@@ -664,20 +627,19 @@ export async function POST(req: Request) {
           const leg = travelMins[i + 1] ?? 10;
           items.push({
             type: "travel",
-            title: "Walk to next stop",
+            title: `Walk to ${stops[i + 1]?.title ?? "next stop"}`,
             durationMin: leg,
             mode: "WALK",
           });
         }
       }
     } else {
-      // Default DRIVE itinerary
       for (let i = 0; i < stops.length; i++) {
         items.push({ type: "stop", durationMin: Math.max(25, stopDurations[i] ?? 40), ...stops[i] });
         if (i < travelMins.length) {
           items.push({
             type: "travel",
-            title: "Drive to next stop",
+            title: `Drive to ${stops[i + 1]?.title ?? "next stop"}`,
             durationMin: travelMins[i],
             mode: "DRIVE",
           });
@@ -691,6 +653,7 @@ export async function POST(req: Request) {
       vibe,
       parkOnce,
       riderMode,
+      bufferMinutes,
       source: "google",
       items,
     });
