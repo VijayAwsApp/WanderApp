@@ -1,11 +1,16 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+
+import Script from "next/script";
 
 type PlanItem = {
   type: "stop" | "travel";
   title: string;
   durationMin: number;
+  mode?: "DRIVE" | "WALK";
+  lat?: number;
+  lng?: number;
   address?: string;
 
   // Enriched fields (present for type === "stop")
@@ -28,6 +33,7 @@ type PlanResponse = {
   destination: string;
   totalMinutes: number;
   vibe: string;
+  parkOnce?: boolean;
   items: PlanItem[];
 };
 
@@ -60,6 +66,46 @@ function formatRating(rating?: number, count?: number) {
   const r = rating.toFixed(1);
   const c = typeof count === "number" ? ` (${count.toLocaleString()})` : "";
   return `${r}★${c}`;
+}
+
+function estimateCostRange(items: PlanItem[]) {
+  // very rough per-stop estimates (USD)
+  // Free: 0-0, $: 10-25, $$: 25-60, $$$: 60-120, $$$$: 120-250
+  const stopItems = items.filter((x) => x.type === "stop");
+  if (stopItems.length === 0) return null;
+
+  let min = 0;
+  let max = 0;
+
+  for (const it of stopItems) {
+    const pl = it.priceLevel || "";
+    if (pl.includes("FREE")) {
+      min += 0;
+      max += 0;
+    } else if (pl.includes("INEXPENSIVE")) {
+      min += 10;
+      max += 25;
+    } else if (pl.includes("MODERATE")) {
+      min += 25;
+      max += 60;
+    } else if (pl.includes("EXPENSIVE")) {
+      min += 60;
+      max += 120;
+    } else if (pl.includes("VERY_EXPENSIVE")) {
+      min += 120;
+      max += 250;
+    } else {
+      // unknown: assume low-to-mid
+      min += 10;
+      max += 60;
+    }
+  }
+
+  // Add small buffer for transport/parking etc.
+  min += 5;
+  max += 20;
+
+  return { min, max };
 }
 
 function IconSparkle(props: { className?: string }) {
@@ -113,6 +159,101 @@ function IconArrow(props: { className?: string }) {
   );
 }
 
+function MapView({
+  apiKey,
+  stops,
+}: {
+  apiKey: string;
+  stops: { title: string; lat: number; lng: number }[];
+}) {
+  const mapDivRef = useRef<HTMLDivElement | null>(null);
+  const mapRef = useRef<any>(null);
+  const markersRef = useRef<any[]>([]);
+  const [loaded, setLoaded] = useState(false);
+
+  const ready = loaded && typeof window !== "undefined" && (window as any).google?.maps;
+
+  useEffect(() => {
+    if (!ready) return;
+    if (!mapDivRef.current) return;
+    if (mapRef.current) return;
+
+    const first = stops?.[0];
+    const center = first ? { lat: first.lat, lng: first.lng } : { lat: 49.2827, lng: -123.1207 };
+
+    const g = (window as any).google;
+    mapRef.current = new g.maps.Map(mapDivRef.current, {
+      center,
+      zoom: 12,
+      mapTypeControl: false,
+      fullscreenControl: false,
+      streetViewControl: false,
+    });
+  }, [loaded, ready, stops]);
+
+  useEffect(() => {
+    if (!ready) return;
+    if (!mapRef.current) return;
+
+    markersRef.current.forEach((m) => m.setMap(null));
+    markersRef.current = [];
+
+    if (!stops || stops.length === 0) return;
+
+    const g = (window as any).google;
+    const bounds = new g.maps.LatLngBounds();
+
+    stops.forEach((s, idx) => {
+      const pos = { lat: s.lat, lng: s.lng };
+      bounds.extend(pos);
+
+      const marker = new g.maps.Marker({
+        map: mapRef.current!,
+        position: pos,
+        title: s.title,
+        label: {
+          text: String(idx + 1),
+          color: "#ffffff",
+          fontWeight: "600",
+        },
+      });
+
+      const info = new g.maps.InfoWindow({
+        content: `<div style=\"font-size:13px; font-weight:600; padding:2px 0;\">${s.title}</div>`,
+      });
+
+      marker.addListener("click", () => info.open({ map: mapRef.current!, anchor: marker }));
+
+      markersRef.current.push(marker);
+    });
+
+    mapRef.current.fitBounds(bounds, 80);
+  }, [loaded, ready, stops]);
+
+  return (
+    <div className="mt-4 overflow-hidden rounded-2xl border border-white/10 bg-black/20">
+      <div className="flex items-center justify-between border-b border-white/10 px-4 py-3">
+        <div className="text-sm font-semibold text-white/85">Map</div>
+        <div className="text-xs text-white/55">Stops: {stops.length}</div>
+      </div>
+      {!ready ? (
+  <div className="flex h-[360px] w-full items-center justify-center text-sm text-white/55">
+    Loading map…
+  </div>
+) : null}
+
+<div ref={mapDivRef} className={"w-full " + (ready ? "h-[360px]" : "h-0")} />
+
+  <Script
+    id="google-maps-js"
+    src={`https://maps.googleapis.com/maps/api/js?key=${apiKey}`}
+    strategy="afterInteractive"
+    onLoad={() => setLoaded(true)}
+  />
+    </div>
+  );
+}
+
 export default function Home() {
   const [destination, setDestination] = useState("");
   const [style, setStyle] = useState<TravelStyleKey>("relaxed");
@@ -120,6 +261,20 @@ export default function Home() {
   const [plan, setPlan] = useState<PlanResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+
+  const [parkOnce, setParkOnce] = useState(false);
+  const [showMap, setShowMap] = useState(true);
+
+  const mapsKey = process.env.NEXT_PUBLIC_GOOGLE_MAPS_API_KEY || "";
+
+  const mapStops = useMemo(() => {
+    if (!plan) return [] as { title: string; lat: number; lng: number }[];
+    return plan.items
+      .filter((it) => it.type === "stop" && typeof it.lat === "number" && typeof it.lng === "number")
+      .map((it) => ({ title: it.title, lat: it.lat as number, lng: it.lng as number }));
+  }, [plan]);
+
+  const cost = useMemo(() => (plan ? estimateCostRange(plan.items) : null), [plan]);
 
   const onGenerate = async () => {
     const dest = destination.trim();
@@ -138,7 +293,7 @@ export default function Home() {
       const res = await fetch("/api/itinerary", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ destination: dest, totalMinutes: duration, vibe: style }),
+        body: JSON.stringify({ destination: dest, totalMinutes: duration, vibe: style, parkOnce }),
       });
 
       if (!res.ok) {
@@ -148,8 +303,9 @@ export default function Home() {
 
       const data = (await res.json()) as PlanResponse;
       setPlan(data);
-    } catch {
-      setError("Could not generate itinerary. Make sure /api/itinerary exists and restart the dev server.");
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : "Could not generate itinerary.";
+      setError(msg);
       setPlan(null);
     } finally {
       setLoading(false);
@@ -290,6 +446,22 @@ export default function Home() {
                 </div>
               </div>
 
+            <div className="mt-3 flex flex-wrap items-center gap-2">
+              <button
+                type="button"
+                onClick={() => setParkOnce((v) => !v)}
+                className={
+                  "rounded-full px-3 py-1.5 text-sm transition " +
+                  (parkOnce
+                    ? "bg-white text-black"
+                    : "border border-white/15 bg-white/5 text-white/85 hover:bg-white/10")
+                }
+              >
+                {parkOnce ? "Park once: ON" : "Park once"}
+              </button>
+              <div className="text-xs text-white/55">Park near the first stop, then walk between stops.</div>
+            </div>
+
               <div className="mt-4 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
                 <div className="text-sm">
                   {error ? (
@@ -311,23 +483,6 @@ export default function Home() {
               </div>
             </div>
 
-            <div className="mt-6 grid gap-3 sm:grid-cols-3">
-              <div className="rounded-2xl border border-white/12 bg-white/5 p-4">
-                <div className="text-xs text-white/55">Format</div>
-                <div className="mt-1 text-sm font-semibold">Stops + travel</div>
-                <div className="mt-1 text-sm text-white/65">2–3 stops with realistic timing.</div>
-              </div>
-              <div className="rounded-2xl border border-white/12 bg-white/5 p-4">
-                <div className="text-xs text-white/55">Routing</div>
-                <div className="mt-1 text-sm font-semibold">API-backed</div>
-                <div className="mt-1 text-sm text-white/65">Uses /api/itinerary in your app.</div>
-              </div>
-              <div className="rounded-2xl border border-white/12 bg-white/5 p-4">
-                <div className="text-xs text-white/55">Next</div>
-                <div className="mt-1 text-sm font-semibold">Map view</div>
-                <div className="mt-1 text-sm text-white/65">Plot stops on a map.</div>
-              </div>
-            </div>
           </div>
 
           {/* preview */}
@@ -341,12 +496,34 @@ export default function Home() {
                     {plan ? (
                       <>
                         {plan.destination || "—"} • {plan.totalMinutes} min • {TRAVEL_STYLES.find((s) => s.key === style)?.label}
+                        {plan.items?.some((x) => x.type === "stop" && (x.photoUrl || x.rating || x.priceLevel || x.openNow !== undefined || x.reviewSnippet || x.parking)) ? (
+                          <span className="ml-2 rounded-full border border-emerald-400/30 bg-emerald-400/10 px-2 py-0.5 text-xs text-emerald-200">
+                            Enriched
+                          </span>
+                        ) : (
+                          <span className="ml-2 rounded-full border border-rose-400/30 bg-rose-400/10 px-2 py-0.5 text-xs text-rose-200">
+                            Basic
+                          </span>
+                        )}
+                        {cost ? (
+                          <span className="ml-2 rounded-full border border-white/15 bg-white/5 px-2 py-0.5 text-xs text-white/80">
+                            Est. ${cost.min}–${cost.max}
+                          </span>
+                        ) : null}
                       </>
                     ) : (
                       "Generate to see your plan here"
                     )}
                   </div>
                 </div>
+                <button
+                  className="rounded-xl border border-white/15 bg-white/5 px-3 py-2 text-sm text-white/85 transition hover:bg-white/10 disabled:opacity-40"
+                  onClick={() => setShowMap((v) => !v)}
+                  disabled={!plan}
+                  type="button"
+                >
+                  {showMap ? "Hide map" : "Show map"}
+                </button>
                 <button
                   className="rounded-xl border border-white/15 bg-white/5 px-3 py-2 text-sm text-white/85 transition hover:bg-white/10 disabled:opacity-40"
                   onClick={() => setPlan(null)}
@@ -358,105 +535,126 @@ export default function Home() {
               </div>
 
               {plan ? (
-                <div className="mt-4 grid gap-3">
-                  {plan.items.map((it, idx) => (
-                    <div
-                      key={idx}
-                      className={
-                        "rounded-2xl border border-white/12 p-4 transition " +
-                        (it.type === "stop" ? "bg-black/20 hover:bg-black/25" : "bg-white/5 hover:bg-white/10")
-                      }
-                    >
-                      <div className="flex items-center justify-between gap-3">
-                        <div className="text-sm font-semibold">{it.type === "stop" ? "Stop" : "Travel"}</div>
-                        <div className="text-xs text-white/55">{it.durationMin} min</div>
-                      </div>
+                <div className="mt-4">
+                  <div className="grid gap-3">
+                    {plan.items.map((it, idx) => (
+                      <div
+                        key={idx}
+                        className={
+                          "rounded-2xl border border-white/12 p-4 transition " +
+                          (it.type === "stop" ? "bg-black/20 hover:bg-black/25" : "bg-white/5 hover:bg-white/10")
+                        }
+                      >
+                        <div className="flex items-center justify-between gap-3">
+                          <div className="text-sm font-semibold">
+                            {it.type === "stop" ? "Stop" : it.mode === "WALK" ? "Walk" : "Drive"}
+                          </div>
+                          <div className="text-xs text-white/55">{it.durationMin} min</div>
+                        </div>
 
-                      <div className="mt-2 flex gap-3">
-                        {it.type === "stop" && it.photoUrl ? (
-                          <img
-                            src={it.photoUrl}
-                            alt={it.title}
-                            className="h-16 w-16 rounded-xl object-cover ring-1 ring-white/10"
-                            loading="lazy"
-                            referrerPolicy="no-referrer"
-                          />
-                        ) : null}
-
-                        <div className="min-w-0 flex-1">
-                          <div className="text-sm text-white/85">{it.title}</div>
-                          {it.address ? <div className="mt-1 text-xs text-white/55">{it.address}</div> : null}
-
-                          {it.type === "stop" ? (
-                            <div className="mt-2 flex flex-wrap items-center gap-2 text-xs">
-                              {formatRating(it.rating, it.userRatingCount) ? (
-                                <span className="rounded-full border border-white/15 bg-white/5 px-2 py-0.5 text-white/80">
-                                  {formatRating(it.rating, it.userRatingCount)}
-                                </span>
-                              ) : null}
-
-                              {formatPriceLevel(it.priceLevel) ? (
-                                <span className="rounded-full border border-white/15 bg-white/5 px-2 py-0.5 text-white/80">
-                                  {formatPriceLevel(it.priceLevel)}
-                                </span>
-                              ) : null}
-
-                              {typeof it.openNow === "boolean" ? (
-                                <span
-                                  className={
-                                    "rounded-full border px-2 py-0.5 " +
-                                    (it.openNow
-                                      ? "border-emerald-400/30 bg-emerald-400/10 text-emerald-200"
-                                      : "border-rose-400/30 bg-rose-400/10 text-rose-200")
-                                  }
-                                >
-                                  {it.openNow ? "Open now" : "Closed"}
-                                </span>
-                              ) : null}
-
-                              {it.mapsUri ? (
-                                <a
-                                  href={it.mapsUri}
-                                  target="_blank"
-                                  rel="noreferrer"
-                                  className="rounded-full border border-white/15 bg-white/5 px-2 py-0.5 text-white/80 hover:bg-white/10"
-                                >
-                                  Maps
-                                </a>
-                              ) : null}
-                            </div>
+                        <div className="mt-2 flex gap-3">
+                          {it.type === "stop" && it.photoUrl ? (
+                            <img
+                              src={it.photoUrl}
+                              alt={it.title}
+                              className="h-16 w-16 rounded-xl object-cover ring-1 ring-white/10"
+                              loading="lazy"
+                              referrerPolicy="no-referrer"
+                            />
                           ) : null}
 
-                          {it.type === "stop" && it.reviewSnippet ? (
-                            <div className="mt-2 text-xs text-white/65">“{it.reviewSnippet}”</div>
-                          ) : null}
+                          <div className="min-w-0 flex-1">
+                            <div className="text-sm text-white/85">{it.title}</div>
+                            {it.address ? <div className="mt-1 text-xs text-white/55">{it.address}</div> : null}
 
-                          {it.type === "stop" && it.parking ? (
-                            <div className="mt-3 rounded-xl border border-white/10 bg-black/20 p-3">
-                              <div className="text-xs font-semibold text-white/80">Parking</div>
-                              <div className="mt-1 text-xs text-white/70">{it.parking.name}</div>
-                              {it.parking.address ? <div className="mt-0.5 text-xs text-white/55">{it.parking.address}</div> : null}
-                              {it.parking.mapsUri ? (
-                                <a
-                                  href={it.parking.mapsUri}
-                                  target="_blank"
-                                  rel="noreferrer"
-                                  className="mt-2 inline-flex text-xs text-white/70 underline decoration-white/30 hover:text-white"
-                                >
-                                  Open parking in Maps..
-                                </a>
-                              ) : null}
-                            </div>
-                          ) : null} 
+                            {it.type === "stop" ? (
+                              <div className="mt-2 flex flex-wrap items-center gap-2 text-xs">
+                                {formatRating(it.rating, it.userRatingCount) ? (
+                                  <span className="rounded-full border border-white/15 bg-white/5 px-2 py-0.5 text-white/80">
+                                    {formatRating(it.rating, it.userRatingCount)}
+                                  </span>
+                                ) : null}
+
+                                {formatPriceLevel(it.priceLevel) ? (
+                                  <span className="rounded-full border border-white/15 bg-white/5 px-2 py-0.5 text-white/80">
+                                    {formatPriceLevel(it.priceLevel)}
+                                  </span>
+                                ) : null}
+
+                                {typeof it.openNow === "boolean" ? (
+                                  <span
+                                    className={
+                                      "rounded-full border px-2 py-0.5 " +
+                                      (it.openNow
+                                        ? "border-emerald-400/30 bg-emerald-400/10 text-emerald-200"
+                                        : "border-rose-400/30 bg-rose-400/10 text-rose-200")
+                                    }
+                                  >
+                                    {it.openNow ? "Open now" : "Closed"}
+                                  </span>
+                                ) : null}
+
+                                {it.mapsUri ? (
+                                  <a
+                                    href={it.mapsUri}
+                                    target="_blank"
+                                    rel="noreferrer"
+                                    className="rounded-full border border-white/15 bg-white/5 px-2 py-0.5 text-white/80 hover:bg-white/10"
+                                  >
+                                    Maps
+                                  </a>
+                                ) : null}
+                              </div>
+                            ) : null}
+
+                            {it.type === "stop" && it.reviewSnippet ? (
+                              <div className="mt-2 text-xs text-white/65">“{it.reviewSnippet}”</div>
+                            ) : null}
+
+                            {it.type === "stop" && it.parking ? (
+                              <div className="mt-3 rounded-xl border border-white/10 bg-black/20 p-3">
+                                <div className="text-xs font-semibold text-white/80">Parking</div>
+                                <div className="mt-1 text-xs text-white/70">{it.parking.name}</div>
+                                {it.parking.address ? (
+                                  <div className="mt-0.5 text-xs text-white/55">{it.parking.address}</div>
+                                ) : null}
+                                {it.parking.mapsUri ? (
+                                  <a
+                                    href={it.parking.mapsUri}
+                                    target="_blank"
+                                    rel="noreferrer"
+                                    className="mt-2 inline-flex text-xs text-white/70 underline decoration-white/30 hover:text-white"
+                                  >
+                                    Open parking in Maps..
+                                  </a>
+                                ) : null}
+                              </div>
+                            ) : null}
+                          </div>
                         </div>
                       </div>
-                    </div>
-                  ))}
+                    ))}
+                  </div>
+
+                  {showMap ? (
+                    mapsKey ? (
+                      <MapView apiKey={mapsKey} stops={mapStops} />
+                    ) : (
+                      <div className="mt-4 rounded-2xl border border-amber-400/20 bg-amber-400/10 p-4 text-sm text-amber-100">
+                        Map view needs <span className="font-semibold">NEXT_PUBLIC_GOOGLE_MAPS_API_KEY</span> in your env.
+                        <div className="mt-1 text-xs text-amber-100/80">
+                          Add it to <code>.env.local</code> and Vercel env vars, then restart.
+                        </div>
+                      </div>
+                    )
+                  ) : null}
                 </div>
               ) : (
                 <div className="mt-6 rounded-2xl border border-white/12 bg-black/20 p-6">
                   <div className="text-sm font-semibold">Try a sample</div>
-                  <div className="mt-1 text-sm text-white/65">Click <span className="text-white">Quick demo</span> in the top right.</div>
+                  <div className="mt-1 text-sm text-white/65">
+                    Click <span className="text-white">Quick demo</span> in the top right.
+                  </div>
                 </div>
               )}
             </div>
@@ -482,9 +680,9 @@ export default function Home() {
               <div className="rounded-2xl border border-white/12 bg-white/5 p-4">
                 <div className="text-sm font-semibold">Next upgrades</div>
                 <div className="mt-2 space-y-1 text-sm text-white/70">
-                  <div>• Google Places for real POIs</div>
                   <div>• Map + pins</div>
-                  <div>• Save & share</div>
+                  <div>• Park once mode</div>
+                  <div>• Cost estimate</div>
                 </div>
               </div>
             </div>
