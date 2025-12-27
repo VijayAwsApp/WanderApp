@@ -678,11 +678,11 @@ export default function Home() {
                 </div>
               </div>
               <div className="rounded-2xl border border-white/12 bg-white/5 p-4">
-                <div className="text-sm font-semibold">Next upgrades</div>
+                <div className="text-sm font-semibold">Tips</div>
                 <div className="mt-2 space-y-1 text-sm text-white/70">
-                  <div>• Map + pins</div>
-                  <div>• Park once mode</div>
-                  <div>• Cost estimate</div>
+                  <div>• Use Park once for walkable areas.</div>
+                  <div>• Tap Maps to open directions.</div>
+                  <div>• Toggle Map to see pins.</div>
                 </div>
               </div>
             </div>
