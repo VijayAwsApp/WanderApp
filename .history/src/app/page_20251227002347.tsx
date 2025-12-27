@@ -284,7 +284,7 @@ export default function Home() {
 
               <div className="mt-3">
                 <div className="flex items-center justify-between">
-                  <div className="text-xs text-white/60">Vibes</div>
+                  <div className="text-xs text-white/60">Vibe</div>
                   <div className="text-xs text-white/45">Tap to switch</div> 
                 </div>
                 <div className="mt-2 flex flex-wrap gap-2">
