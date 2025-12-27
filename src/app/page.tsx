@@ -6,6 +6,7 @@ import Script from "next/script";
 type PlanItem = {
   type: "stop" | "travel";
   title: string;
+  placeId?: string; // ✅ added for swap
   durationMin: number;
   mode?: "DRIVE" | "WALK";
   lat?: number;
@@ -36,6 +37,11 @@ type PlanResponse = {
   riderMode?: boolean;
   bufferMinutes?: number;
   items: PlanItem[];
+};
+
+type ScheduledPlanItem = PlanItem & {
+  start: Date;
+  end: Date;
 };
 
 const APP_NAME = "Wander App";
@@ -148,6 +154,19 @@ function estimateCostRange(items: PlanItem[]) {
   return { min, max };
 }
 
+function formatTime(d: Date) {
+  try {
+    return new Intl.DateTimeFormat(undefined, {
+      hour: "2-digit",
+      minute: "2-digit",
+    }).format(d);
+  } catch {
+    const hh = String(d.getHours()).padStart(2, "0");
+    const mm = String(d.getMinutes()).padStart(2, "0");
+    return `${hh}:${mm}`;
+  }
+}
+
 function IconSparkle(props: { className?: string }) {
   return (
     <svg
@@ -157,17 +176,39 @@ function IconSparkle(props: { className?: string }) {
       xmlns="http://www.w3.org/2000/svg"
       aria-hidden="true"
     >
+      {/* Compass ring */}
       <path
-        d="M12 2l1.1 5.2L18 9l-4.9 1.8L12 16l-1.1-5.2L6 9l4.9-1.8L12 2z"
+        d="M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18Z"
         stroke="currentColor"
-        strokeWidth="1.5"
-        strokeLinejoin="round"
+        strokeWidth="1.6"
+        opacity="0.9"
+      />
+      {/* Cardinal ticks */}
+      <path
+        d="M12 3.5v2.2M12 18.3v2.2M3.5 12h2.2M18.3 12h2.2"
+        stroke="currentColor"
+        strokeWidth="1.6"
+        strokeLinecap="round"
+        opacity="0.6"
+      />
+      {/* Needle */}
+      <path
+        d="M14.9 9.1 13 13l-3.9 1.9L11 11l3.9-1.9Z"
+        fill="currentColor"
+        opacity="0.9"
       />
       <path
-        d="M19 13l.7 3.2 3.3.8-3.3.8L19 21l-.7-3.2-3.3-.8 3.3-.8L19 13z"
+        d="M14.9 9.1 13 13l-3.9 1.9L11 11l3.9-1.9Z"
         stroke="currentColor"
-        strokeWidth="1.5"
+        strokeWidth="1.2"
         strokeLinejoin="round"
+        opacity="0.9"
+      />
+      {/* Center dot */}
+      <path
+        d="M12 12.1a.9.9 0 1 0 0-1.8.9.9 0 0 0 0 1.8Z"
+        fill="currentColor"
+        opacity="0.9"
       />
     </svg>
   );
@@ -196,6 +237,77 @@ function IconArrow(props: { className?: string }) {
         strokeLinejoin="round"
       />
     </svg>
+  );
+}
+
+function IconCheck(props: { className?: string }) {
+  return (
+    <svg
+      className={props.className}
+      viewBox="0 0 24 24"
+      fill="none"
+      xmlns="http://www.w3.org/2000/svg"
+      aria-hidden="true"
+    >
+      <path
+        d="M20 6L9 17l-5-5"
+        stroke="currentColor"
+        strokeWidth="1.8"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    </svg>
+  );
+}
+
+function ToggleRow(props: {
+  label: string;
+  description: string;
+  value: boolean;
+  onChange: (v: boolean) => void;
+}) {
+  const { label, description, value, onChange } = props;
+  return (
+    <button
+      type="button"
+      onClick={() => onChange(!value)}
+      className="flex w-full items-start justify-between gap-4 rounded-2xl border border-white/12 bg-white/5 px-4 py-3 text-left transition hover:bg-white/10"
+      aria-pressed={value}
+    >
+      <div className="min-w-0">
+        <div className="flex items-center gap-2 text-sm font-semibold text-white/90">
+          <span>{label}</span>
+          {value ? (
+            <span className="inline-flex items-center gap-1 rounded-full border border-emerald-400/30 bg-emerald-400/10 px-2 py-0.5 text-[11px] font-semibold text-emerald-200">
+              <IconCheck className="h-3.5 w-3.5" />
+              On
+            </span>
+          ) : (
+            <span className="inline-flex items-center rounded-full border border-white/12 bg-black/20 px-2 py-0.5 text-[11px] font-semibold text-white/60">
+              Off
+            </span>
+          )}
+        </div>
+        <div className="mt-1 text-xs leading-relaxed text-white/60">{description}</div>
+      </div>
+
+      <div
+        className={
+          "mt-0.5 flex h-6 w-11 items-center rounded-full border transition " +
+          (value
+            ? "border-emerald-400/30 bg-emerald-400/20"
+            : "border-white/12 bg-black/20")
+        }
+        aria-hidden="true"
+      >
+        <div
+          className={
+            "h-5 w-5 rounded-full bg-white transition " +
+            (value ? "translate-x-5" : "translate-x-0.5")
+          }
+        />
+      </div>
+    </button>
   );
 }
 
@@ -321,7 +433,9 @@ function MapView({
         : g.maps.TravelMode.DRIVING;
 
     const destination = pts[pts.length - 1];
-    const waypoints = pts.slice(0, -1).map((p) => ({ location: p, stopover: true }));
+    const waypoints = pts
+      .slice(0, -1)
+      .map((p) => ({ location: p, stopover: true }));
 
     ds.route(
       {
@@ -354,13 +468,17 @@ function MapView({
           {origin ? " + you" : ""}
         </div>
       </div>
+
       {!ready ? (
         <div className="flex h-[360px] w-full items-center justify-center text-sm text-white/55">
           Loading map…
         </div>
       ) : null}
 
-      <div ref={mapDivRef} className={"w-full " + (ready ? "h-[360px]" : "h-0")} />
+      <div
+        ref={mapDivRef}
+        className={"w-full " + (ready ? "h-[360px]" : "h-0")}
+      />
 
       <Script
         id="google-maps-js"
@@ -380,12 +498,19 @@ export default function Home() {
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
 
+  const [swappingIdx, setSwappingIdx] = useState<number | null>(null); // ✅ added
+
   const [parkOnce, setParkOnce] = useState(false);
   const [riderMode, setRiderMode] = useState(false);
   const [addBuffer, setAddBuffer] = useState(false);
 
+  const [startMode, setStartMode] = useState<"now" | "custom">("now");
+  const [startClock, setStartClock] = useState("10:00");
+
   const [showMap, setShowMap] = useState(true);
-  const [userLoc, setUserLoc] = useState<{ lat: number; lng: number } | null>(null);
+  const [userLoc, setUserLoc] = useState<{ lat: number; lng: number } | null>(
+    null
+  );
   const [locError, setLocError] = useState<string | null>(null);
 
   const mapsKey = process.env.NEXT_PUBLIC_GOOGLE_MAPS_API_KEY || "";
@@ -394,21 +519,57 @@ export default function Home() {
     if (!plan) return [] as { title: string; lat: number; lng: number }[];
     return plan.items
       .filter(
-        (it) => it.type === "stop" && typeof it.lat === "number" && typeof it.lng === "number"
+        (it) =>
+          it.type === "stop" &&
+          typeof it.lat === "number" &&
+          typeof it.lng === "number"
       )
-      .map((it) => ({ title: it.title, lat: it.lat as number, lng: it.lng as number }));
+      .map((it) => ({
+        title: it.title,
+        lat: it.lat as number,
+        lng: it.lng as number,
+      }));
   }, [plan]);
 
   const routeStops = useMemo(() => {
     if (!plan) return [] as { lat: number; lng: number }[];
     return plan.items
       .filter(
-        (it) => it.type === "stop" && typeof it.lat === "number" && typeof it.lng === "number"
+        (it) =>
+          it.type === "stop" &&
+          typeof it.lat === "number" &&
+          typeof it.lng === "number"
       )
       .map((it) => ({ lat: it.lat as number, lng: it.lng as number }));
   }, [plan]);
 
-  const cost = useMemo(() => (plan ? estimateCostRange(plan.items) : null), [plan]);
+  const cost = useMemo(
+    () => (plan ? estimateCostRange(plan.items) : null),
+    [plan]
+  );
+
+  const scheduledItems = useMemo((): ScheduledPlanItem[] => {
+    if (!plan) return [];
+
+    const base = new Date();
+    let cursor = new Date(base);
+
+    if (startMode === "custom") {
+      const parts = String(startClock || "").split(":");
+      const hh = Number(parts[0]);
+      const mm = Number(parts[1]);
+      if (Number.isFinite(hh) && Number.isFinite(mm)) {
+        cursor.setHours(hh, mm, 0, 0);
+      }
+    }
+
+    return plan.items.map((item) => {
+      const start = new Date(cursor);
+      const end = new Date(cursor.getTime() + (item.durationMin || 0) * 60_000);
+      cursor = end;
+      return { ...item, start, end };
+    });
+  }, [plan, startMode, startClock]);
 
   async function captureMyLocation() {
     setLocError(null);
@@ -475,6 +636,73 @@ export default function Home() {
     }
   };
 
+  // ✅ Swap stop handler
+  const onSwapStop = async (stopIdxInStops: number) => {
+    if (!plan) return;
+
+    const stopsOnly = plan.items
+      .filter((x) => x.type === "stop")
+      .map((s) => ({
+        placeId: s.placeId,
+        title: s.title,
+        durationMin: s.durationMin,
+        lat: s.lat,
+        lng: s.lng,
+      }))
+      .filter(
+        (s) =>
+          typeof s.placeId === "string" &&
+          s.placeId.length > 0 &&
+          typeof s.lat === "number" &&
+          typeof s.lng === "number"
+      );
+
+    const target = stopsOnly[stopIdxInStops];
+    if (!target?.placeId || typeof target.lat !== "number" || typeof target.lng !== "number") {
+      setError(
+        "Swap isn’t available for this stop yet (missing Google placeId or coordinates). Please Generate again."
+      );
+      return;
+    }
+
+    setError(null);
+    setSwappingIdx(stopIdxInStops);
+
+    try {
+      const res = await fetch("/api/itinerary", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          action: "swap",
+          destination: plan.destination,
+          totalMinutes: plan.totalMinutes,
+          vibe: style,
+          parkOnce,
+          riderMode,
+          bufferMinutes: addBuffer ? 10 : 0,
+          stops: stopsOnly,
+          swapIndex: stopIdxInStops,
+          swapPlaceId: target.placeId,
+          swapLat: target.lat,
+          swapLng: target.lng,
+        }),
+      });
+
+      if (!res.ok) {
+        const txt = await res.text().catch(() => "");
+        throw new Error(txt || "Swap failed");
+      }
+
+      const data = (await res.json()) as PlanResponse;
+      setPlan(data);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : "Swap failed";
+      setError(msg);
+    } finally {
+      setSwappingIdx(null);
+    }
+  };
+
   const onQuickDemo = () => {
     setDestination("Vancouver");
     setStyle("culture");
@@ -501,7 +729,7 @@ export default function Home() {
       <header className="sticky top-0 z-20 border-b border-white/10 bg-[#070A12]/70 backdrop-blur">
         <div className="mx-auto flex max-w-6xl items-center justify-between px-4 py-3">
           <div className="flex items-center gap-2">
-            <div className="grid h-9 w-9 place-items-center rounded-xl bg-white/10 ring-1 ring-white/15">
+            <div className="grid h-9 w-9 place-items-center rounded-xl bg-white/10 ring-1 ring-white/15 shadow-[0_0_0_1px_rgba(255,255,255,0.06)]">
               <IconSparkle className="h-5 w-5" />
             </div>
             <div className="leading-tight">
@@ -614,53 +842,95 @@ export default function Home() {
                 </div>
               </div>
 
-              <div className="mt-4 flex flex-col gap-2">
-                <button
-                  type="button"
-                  onClick={() => setParkOnce((v) => !v)}
-                  className={
-                    "self-start rounded-full px-3 py-1.5 text-sm transition " +
-                    (parkOnce
-                      ? "bg-white text-black"
-                      : "border border-white/15 bg-white/5 text-white/85 hover:bg-white/10")
-                  }
-                >
-                  {parkOnce ? "Park once: ON" : "Park once"}
-                </button>
+              <div className="mt-4">
+                <div className="flex items-center justify-between">
+                  <div className="text-xs text-white/60">Options</div>
+                  <div className="text-xs text-white/45">Tap to toggle</div>
+                </div>
 
-                <button
-                  type="button"
-                  onClick={() => setRiderMode((v) => !v)}
-                  className={
-                    "self-start rounded-full px-3 py-1.5 text-sm transition " +
-                    (riderMode
-                      ? "bg-white text-black"
-                      : "border border-white/15 bg-white/5 text-white/85 hover:bg-white/10")
-                  }
-                >
-                  {riderMode ? "Rider mode: ON" : "Rider mode"}
-                </button>
+                <div className="mt-2 grid gap-2">
+                  <ToggleRow
+                    label="Park once"
+                    description="Pick a walkable cluster: park near the first stop, then walk between stops."
+                    value={parkOnce}
+                    onChange={(v) => setParkOnce(v)}
+                  />
 
-                <button
-                  type="button"
-                  onClick={() => setAddBuffer((v) => !v)}
-                  className={
-                    "self-start rounded-full px-3 py-1.5 text-sm transition " +
-                    (addBuffer
-                      ? "bg-white text-black"
-                      : "border border-white/15 bg-white/5 text-white/85 hover:bg-white/10")
-                  }
-                >
-                  {addBuffer ? "Buffer: +10 min" : "Add buffer"}
-                </button>
+                  <ToggleRow
+                    label="Rider mode"
+                    description="More scenic stops + easy pull-ins. Better for motorcycles and quick loops."
+                    value={riderMode}
+                    onChange={(v) => setRiderMode(v)}
+                  />
 
-                <div className="text-xs text-white/55">
-                  {parkOnce ? "Park near the first stop, then walk between stops. " : ""}
-                  {riderMode ? "More scenic stops, easier pull-ins, loop-friendly ordering. " : ""}
-                  {addBuffer ? "Adds +10 min buffer to each travel leg for parking/traffic." : ""}
-                  {!parkOnce && !riderMode && !addBuffer
-                    ? "Optional: Park once for walkable clusters, Rider mode for scenic stops, and Buffer for realism."
-                    : null}
+                  <ToggleRow
+                    label="Add buffer"
+                    description="Adds +10 minutes to each travel leg for traffic, parking, and delays."
+                    value={addBuffer}
+                    onChange={(v) => setAddBuffer(v)}
+                  />
+                </div>
+
+                <div className="mt-2 text-xs text-white/55">
+                  {parkOnce || riderMode || addBuffer
+                    ? "Nice — your itinerary will adapt based on these toggles."
+                    : "Optional: turn these on to make your plan more realistic and easier to follow."}
+                </div>
+              </div>
+
+              <div className="mt-4 rounded-xl border border-white/10 bg-black/20 px-3 py-3">
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <div>
+                    <div className="text-xs text-white/60">Schedule</div>
+                    <div className="mt-0.5 text-sm font-semibold text-white/85">Start time</div>
+                  </div>
+
+                  <div className="flex flex-wrap items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() => setStartMode("now")}
+                      className={
+                        "rounded-full px-3 py-1.5 text-sm transition " +
+                        (startMode === "now"
+                          ? "bg-white text-black"
+                          : "border border-white/15 bg-white/5 text-white/85 hover:bg-white/10")
+                      }
+                    >
+                      Now
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => setStartMode("custom")}
+                      className={
+                        "rounded-full px-3 py-1.5 text-sm transition " +
+                        (startMode === "custom"
+                          ? "bg-white text-black"
+                          : "border border-white/15 bg-white/5 text-white/85 hover:bg-white/10")
+                      }
+                    >
+                      Choose time
+                    </button>
+
+                    <input
+                      type="time"
+                      value={startClock}
+                      onChange={(e) => {
+                        setStartClock(e.target.value);
+                        setStartMode("custom");
+                      }}
+                      className={
+                        "rounded-xl border px-3 py-2 text-sm outline-none transition " +
+                        (startMode === "custom"
+                          ? "border-white/25 bg-black/30 text-white"
+                          : "border-white/10 bg-black/20 text-white/60")
+                      }
+                    />
+                  </div>
+                </div>
+
+                <div className="mt-2 text-xs text-white/55">
+                  Shows real start/end times for each drive/walk and stop.
                 </div>
               </div>
 
@@ -728,7 +998,9 @@ export default function Home() {
                   </div>
 
                   {locError ? (
-                    <div className="mt-2 text-xs text-rose-200/90">{locError}</div>
+                    <div className="mt-2 text-xs text-rose-200/90">
+                      {locError} You can still open routes—starting point will default to the first stop.
+                    </div>
                   ) : null}
 
                   {showMap ? (
@@ -819,7 +1091,7 @@ export default function Home() {
 
                 {plan ? (
                   <div className="mt-4 grid gap-3">
-                    {plan.items.map((it, idx) => (
+                    {scheduledItems.map((it, idx) => (
                       <div
                         key={idx}
                         className={
@@ -829,15 +1101,53 @@ export default function Home() {
                             : "bg-white/5 hover:bg-white/10")
                         }
                       >
-                        <div className="flex items-center justify-between gap-3">
-                          <div className="text-sm font-semibold">
-                            {it.type === "stop"
-                              ? "Stop"
-                              : it.mode === "WALK"
-                              ? "Walk"
-                              : "Drive"}
+                        <div className="flex items-start justify-between gap-3">
+                          <div>
+                            <div className="text-sm font-semibold">
+                              {it.type === "stop"
+                                ? "Stop"
+                                : it.mode === "WALK"
+                                ? "Walk"
+                                : "Drive"}
+                            </div>
+                            <div className="mt-0.5 text-xs text-white/55">
+                              {formatTime(it.start)} – {formatTime(it.end)}
+                            </div>
                           </div>
-                          <div className="text-xs text-white/55">{it.durationMin} min</div>
+
+                          {/* ✅ Swap + duration */}
+                          <div className="flex items-center gap-2">
+                            {it.type === "stop" ? (
+                              <>
+                                {(() => {
+                                  const currentStopIndex =
+                                    scheduledItems
+                                      .slice(0, idx + 1)
+                                      .filter((x) => x.type === "stop").length - 1;
+                                  const isThisSwapping = swappingIdx === currentStopIndex;
+
+                                  return (
+                                    <button
+                                      type="button"
+                                      onClick={() => {
+                                        void onSwapStop(currentStopIndex);
+                                      }}
+                                      disabled={isThisSwapping}
+                                      className={
+                                        "rounded-full px-2 py-1 text-xs transition " +
+                                        (isThisSwapping
+                                          ? "border border-white/10 bg-white/5 text-white/45"
+                                          : "border border-white/15 bg-white/5 text-white/80 hover:bg-white/10")
+                                      }
+                                    >
+                                      {isThisSwapping ? "Swapping…" : "Swap"}
+                                    </button>
+                                  );
+                                })()}
+                              </>
+                            ) : null}
+                            <div className="text-xs text-white/55">{it.durationMin} min</div>
+                          </div>
                         </div>
 
                         <div className="mt-2 flex gap-3">
@@ -928,7 +1238,9 @@ export default function Home() {
                                 <div className="text-xs font-semibold text-white/80">Parking</div>
                                 <div className="mt-1 text-xs text-white/70">{it.parking.name}</div>
                                 {it.parking.address ? (
-                                  <div className="mt-0.5 text-xs text-white/55">{it.parking.address}</div>
+                                  <div className="mt-0.5 text-xs text-white/55">
+                                    {it.parking.address}
+                                  </div>
                                 ) : null}
                                 {it.parking.mapsUri ? (
                                   <a

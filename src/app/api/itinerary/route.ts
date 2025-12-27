@@ -243,7 +243,7 @@ async function getPlaceDetails(key: string, placeId: string) {
     key,
     method: "GET",
     fieldMask:
-      "id,displayName,formattedAddress,location,rating,userRatingCount,priceLevel,regularOpeningHours,photos,reviews,googleMapsUri",
+      "id,displayName,formattedAddress,location,types,rating,userRatingCount,priceLevel,regularOpeningHours,photos,reviews,googleMapsUri",
   });
   if (!res.ok) throw new Error(await res.text());
   return (await res.json()) as any;
@@ -331,6 +331,293 @@ export async function POST(req: Request) {
   try {
     const body = await req.json().catch(() => ({}));
 
+    const action = String(body?.action ?? "").trim();
+
+    // -----------------------------
+    // SWAP STOP (replace only 1 stop)
+    // -----------------------------
+    if (action === "swap") {
+      const destination = String(body?.destination ?? "").trim();
+      const totalMinutes = clamp(Number(body?.totalMinutes ?? 150), 120, 180);
+      const vibe = String(body?.vibe ?? "culture");
+      const parkOnce = Boolean(body?.parkOnce);
+      const riderMode = Boolean(body?.riderMode);
+      const bufferMinutes = clamp(Number(body?.bufferMinutes ?? 0), 0, 20);
+
+      const swapIndex = clamp(Number(body?.swapIndex ?? -1), 0, 10);
+      const swapPlaceId = String(body?.swapPlaceId ?? "").trim();
+      const swapLat = Number(body?.swapLat);
+      const swapLng = Number(body?.swapLng);
+
+      const rawStops = Array.isArray(body?.stops) ? body.stops : [];
+
+      if (!destination) {
+        return NextResponse.json({ error: "Destination is required" }, { status: 400 });
+      }
+
+      const key = process.env.GOOGLE_MAPS_API_KEY;
+      if (!key) {
+        return NextResponse.json(
+          { error: "Missing GOOGLE_MAPS_API_KEY. Add it to .env.local and restart npm run dev." },
+          { status: 500 }
+        );
+      }
+
+      const stopsInput = rawStops
+        .map((s: any) => ({
+          placeId: String(s?.placeId ?? "").trim(),
+          title: String(s?.title ?? "").trim(),
+          durationMin: clamp(Number(s?.durationMin ?? 40), 20, 180),
+          lat: Number(s?.lat),
+          lng: Number(s?.lng),
+        }))
+        .filter((s: any) => s.placeId);
+
+      if (stopsInput.length < 2) {
+        return NextResponse.json({ error: "Not enough stops to swap" }, { status: 400 });
+      }
+
+      if (swapIndex < 0 || swapIndex >= stopsInput.length) {
+        return NextResponse.json({ error: "Invalid swap index" }, { status: 400 });
+      }
+
+      const currentStop = stopsInput[swapIndex];
+      const centerLat = Number.isFinite(swapLat) ? swapLat : currentStop?.lat;
+      const centerLng = Number.isFinite(swapLng) ? swapLng : currentStop?.lng;
+
+      if (!swapPlaceId || !Number.isFinite(centerLat) || !Number.isFinite(centerLng)) {
+        return NextResponse.json({ error: "Invalid swap request" }, { status: 400 });
+      }
+
+      // Determine category of the stop being swapped using its current place types
+      let swapTypes: string[] = [];
+      try {
+        const d = await getPlaceDetails(key, swapPlaceId);
+        swapTypes = Array.isArray(d?.types) ? (d.types as string[]) : [];
+      } catch {
+        swapTypes = [];
+      }
+
+      const targetCategory = pickCategory(swapTypes);
+
+      const qNearby =
+        targetCategory === "food"
+          ? `cafes restaurants near ${centerLat},${centerLng}`
+          : targetCategory === "park"
+          ? `parks viewpoints near ${centerLat},${centerLng}`
+          : `tourist attractions museums near ${centerLat},${centerLng}`;
+
+      let candidates: any[] = [];
+      try {
+        candidates = await searchPlacesText(key, qNearby, 30);
+      } catch {
+        candidates = [];
+      }
+
+      const excludeIds = new Set(stopsInput.map((s: any) => s.placeId));
+      excludeIds.delete(swapPlaceId);
+
+      const swapCenter: LatLng = { latitude: centerLat, longitude: centerLng };
+      const maxKm = parkOnce ? 2.0 : 4.0;
+
+      const filtered = candidates
+        .filter((p) => p?.id && p?.location?.latitude != null && p?.location?.longitude != null)
+        .filter((p) => !excludeIds.has(String(p.id)))
+        .filter((p) => !isNoisyType(p?.types))
+        .filter((p) => pickCategory(p?.types) === targetCategory)
+        .filter((p) => haversineKm(swapCenter, p.location) <= maxKm)
+        .sort((a, b) => scoreCandidate(b, riderMode) - scoreCandidate(a, riderMode));
+
+      const replacement = filtered[0];
+      if (!replacement?.id) {
+        return NextResponse.json({ error: "No replacement found nearby" }, { status: 404 });
+      }
+
+      // Replace only the swapped stop's placeId; keep durations exactly as provided
+      const nextStops = [...stopsInput];
+      nextStops[swapIndex] = {
+        ...nextStops[swapIndex],
+        placeId: String(replacement.id),
+      };
+
+      // Enrich all stops with place details (2–3 stops only)
+      const stops: StopDetails[] = await Promise.all(
+        nextStops.map(async (s: any) => {
+          const details = await getPlaceDetails(key, s.placeId);
+
+          let photoUrl: string | undefined;
+          const firstPhotoName = details?.photos?.[0]?.name;
+          if (firstPhotoName) {
+            photoUrl = await getPhotoUri(key, firstPhotoName, 1000);
+          }
+
+          const reviewSnippet = safeText(details?.reviews?.[0]?.text?.text, 170);
+          const openNow = details?.regularOpeningHours?.openNow;
+          const weekdayText = Array.isArray(details?.regularOpeningHours?.weekdayDescriptions)
+            ? (details.regularOpeningHours.weekdayDescriptions as string[])
+            : undefined;
+
+          let parking: ParkingOption | undefined;
+          try {
+            const base = await findParkingNear(key, details?.displayName?.text ?? "", destination);
+            parking = await enrichParkingMapsUri(key, base);
+          } catch {
+            parking = undefined;
+          }
+
+          return {
+            placeId: String(s.placeId),
+            title: details?.displayName?.text ?? s.title ?? "Place",
+            address: details?.formattedAddress,
+            lat: Number(details?.location?.latitude),
+            lng: Number(details?.location?.longitude),
+            mapsUri: details?.googleMapsUri,
+
+            rating: typeof details?.rating === "number" ? details.rating : undefined,
+            userRatingCount:
+              typeof details?.userRatingCount === "number" ? details.userRatingCount : undefined,
+            priceLevel: typeof details?.priceLevel === "string" ? details.priceLevel : undefined,
+            openNow: typeof openNow === "boolean" ? openNow : undefined,
+            weekdayText,
+            photoUrl,
+            reviewSnippet,
+            parking,
+          } as StopDetails;
+        })
+      );
+
+      // Park-once anchor parking near the FIRST stop
+      let parkOnceLocation: ParkingOption | undefined;
+      if (parkOnce && stops.length > 0) {
+        try {
+          const base = await findParkingNear(key, stops[0].title, destination);
+          parkOnceLocation = await enrichParkingMapsUri(key, base);
+        } catch {
+          parkOnceLocation = undefined;
+        }
+      }
+
+      // Compute travel legs
+      const travelMins: number[] = [];
+
+      if (parkOnce && parkOnceLocation?.lat != null && parkOnceLocation?.lng != null && stops.length > 0) {
+        const firstStop = stops[0];
+        const fromParkingToFirst = await computeRouteMinutes(
+          key,
+          { latitude: parkOnceLocation.lat, longitude: parkOnceLocation.lng },
+          { latitude: firstStop.lat, longitude: firstStop.lng },
+          "WALK"
+        );
+        travelMins.push(fromParkingToFirst + bufferMinutes);
+
+        for (let i = 0; i < stops.length - 1; i++) {
+          const a = stops[i];
+          const b = stops[i + 1];
+          const mins = await computeRouteMinutes(
+            key,
+            { latitude: a.lat, longitude: a.lng },
+            { latitude: b.lat, longitude: b.lng },
+            "WALK"
+          );
+          travelMins.push(mins + bufferMinutes);
+        }
+      } else {
+        for (let i = 0; i < stops.length - 1; i++) {
+          const a = stops[i];
+          const b = stops[i + 1];
+          const mins = await computeRouteMinutes(
+            key,
+            { latitude: a.lat, longitude: a.lng },
+            { latitude: b.lat, longitude: b.lng },
+            "DRIVE"
+          );
+          travelMins.push(mins + bufferMinutes);
+        }
+      }
+
+      // Preserve stop durations exactly from the client
+      const stopDurations = nextStops.map((s: any) => clamp(Number(s?.durationMin ?? 40), 20, 180));
+
+      const items: PlanItem[] = [];
+
+      if (parkOnce && parkOnceLocation?.lat != null && parkOnceLocation?.lng != null) {
+        items.push({
+          type: "stop",
+          durationMin: 5,
+          placeId: parkOnceLocation.placeId || "parking",
+          title: "Park once",
+          address: parkOnceLocation.address,
+          lat: parkOnceLocation.lat,
+          lng: parkOnceLocation.lng,
+          mapsUri: parkOnceLocation.mapsUri,
+          rating: undefined,
+          userRatingCount: undefined,
+          priceLevel: undefined,
+          openNow: undefined,
+          weekdayText: undefined,
+          photoUrl: undefined,
+          reviewSnippet: undefined,
+          parking: {
+            placeId: parkOnceLocation.placeId,
+            name: parkOnceLocation.name,
+            address: parkOnceLocation.address,
+            lat: parkOnceLocation.lat,
+            lng: parkOnceLocation.lng,
+            mapsUri: parkOnceLocation.mapsUri,
+          },
+        });
+
+        if (travelMins.length > 0) {
+          items.push({
+            type: "travel",
+            title: `Walk to ${stops[0]?.title ?? "first stop"}`,
+            durationMin: travelMins[0],
+            mode: "WALK",
+          });
+        }
+
+        for (let i = 0; i < stops.length; i++) {
+          items.push({ type: "stop", durationMin: stopDurations[i] ?? 40, ...stops[i] });
+          if (i < stops.length - 1) {
+            const leg = travelMins[i + 1] ?? 10;
+            items.push({
+              type: "travel",
+              title: `Walk to ${stops[i + 1]?.title ?? "next stop"}`,
+              durationMin: leg,
+              mode: "WALK",
+            });
+          }
+        }
+      } else {
+        for (let i = 0; i < stops.length; i++) {
+          items.push({ type: "stop", durationMin: stopDurations[i] ?? 40, ...stops[i] });
+          if (i < travelMins.length) {
+            items.push({
+              type: "travel",
+              title: `Drive to ${stops[i + 1]?.title ?? "next stop"}`,
+              durationMin: travelMins[i],
+              mode: "DRIVE",
+            });
+          }
+        }
+      }
+
+      return NextResponse.json({
+        destination,
+        totalMinutes,
+        vibe,
+        parkOnce,
+        riderMode,
+        bufferMinutes,
+        source: "google",
+        items,
+      });
+    }
+
+    // --------
+    // EXISTING LOGIC BELOW (for non-swap)
+    // --------
+
     const destination = String(body?.destination ?? "").trim();
     const totalMinutes = clamp(Number(body?.totalMinutes ?? 150), 120, 180);
     const vibe = String(body?.vibe ?? "culture");
@@ -372,7 +659,7 @@ export async function POST(req: Request) {
       searchPlacesText(key, qAttraction, 20),
       searchPlacesText(key, qFood, 20),
       searchPlacesText(key, qPark, 20),
-      searchPlacesText(key, query, 20),
+      searchPlacesText(key, qScenic, 20),
       searchPlacesText(key, riderMode ? qScenic : qAttraction, 20),
       searchPlacesText(key, riderMode ? qRideCoffee : qFood, 20),
     ]);
