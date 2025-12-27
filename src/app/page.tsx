@@ -68,6 +68,50 @@ function formatRating(rating?: number, count?: number) {
   return `${r}★${c}`;
 }
 
+function latLngStr(p?: { lat: number; lng: number } | null) {
+  if (!p) return "";
+  return `${p.lat},${p.lng}`;
+}
+
+function buildGoogleMapsRouteUrl(args: {
+  origin?: { lat: number; lng: number } | null;
+  stops: { lat: number; lng: number }[];
+  travelMode?: "driving" | "walking";
+}) {
+  const { origin, stops, travelMode = "driving" } = args;
+  if (!stops || stops.length === 0) return "https://www.google.com/maps";
+
+  const destination = latLngStr(stops[stops.length - 1]);
+  const waypoints = stops
+    .slice(0, -1)
+    .map((s) => latLngStr(s))
+    .filter(Boolean)
+    .join("|");
+
+  const params = new URLSearchParams();
+  params.set("api", "1");
+  if (origin) params.set("origin", latLngStr(origin));
+  params.set("destination", destination);
+  if (waypoints) params.set("waypoints", waypoints);
+  params.set("travelmode", travelMode);
+
+  return `https://www.google.com/maps/dir/?${params.toString()}`;
+}
+
+function buildGoogleMapsToStopUrl(args: {
+  origin?: { lat: number; lng: number } | null;
+  destination: { lat: number; lng: number };
+  travelMode?: "driving" | "walking";
+}) {
+  const { origin, destination, travelMode = "driving" } = args;
+  const params = new URLSearchParams();
+  params.set("api", "1");
+  if (origin) params.set("origin", latLngStr(origin));
+  params.set("destination", latLngStr(destination));
+  params.set("travelmode", travelMode);
+  return `https://www.google.com/maps/dir/?${params.toString()}`;
+}
+
 function estimateCostRange(items: PlanItem[]) {
   // very rough per-stop estimates (USD)
   // Free: 0-0, $: 10-25, $$: 25-60, $$$: 60-120, $$$$: 120-250
@@ -162,13 +206,18 @@ function IconArrow(props: { className?: string }) {
 function MapView({
   apiKey,
   stops,
+  origin,
+  travelMode,
 }: {
   apiKey: string;
   stops: { title: string; lat: number; lng: number }[];
+  origin?: { lat: number; lng: number } | null;
+  travelMode?: "DRIVING" | "WALKING";
 }) {
   const mapDivRef = useRef<HTMLDivElement | null>(null);
   const mapRef = useRef<any>(null);
   const markersRef = useRef<any[]>([]);
+  const directionsRef = useRef<any>(null);
   const [loaded, setLoaded] = useState(false);
 
   const ready = loaded && typeof window !== "undefined" && (window as any).google?.maps;
@@ -189,7 +238,7 @@ function MapView({
       fullscreenControl: false,
       streetViewControl: false,
     });
-  }, [loaded, ready, stops]);
+  }, [loaded, ready, stops, origin]);
 
   useEffect(() => {
     if (!ready) return;
@@ -202,6 +251,10 @@ function MapView({
 
     const g = (window as any).google;
     const bounds = new g.maps.LatLngBounds();
+
+    if (origin?.lat != null && origin?.lng != null) {
+      bounds.extend({ lat: origin.lat, lng: origin.lng });
+    }
 
     stops.forEach((s, idx) => {
       const pos = { lat: s.lat, lng: s.lng };
@@ -228,28 +281,80 @@ function MapView({
     });
 
     mapRef.current.fitBounds(bounds, 80);
-  }, [loaded, ready, stops]);
+  }, [loaded, ready, stops, origin]);
+
+  useEffect(() => {
+    if (!ready || !mapRef.current) return;
+    if (!origin || origin.lat == null || origin.lng == null) return;
+    if (!stops || stops.length === 0) return;
+
+    const g = (window as any).google;
+
+    // Clean up any previous renderer
+    if (directionsRef.current) {
+      try {
+        directionsRef.current.setMap(null);
+      } catch {}
+      directionsRef.current = null;
+    }
+
+    const ds = new g.maps.DirectionsService();
+    const dr = new g.maps.DirectionsRenderer({
+      suppressMarkers: true,
+      preserveViewport: true,
+    });
+
+    dr.setMap(mapRef.current);
+    directionsRef.current = dr;
+
+    const mode = travelMode === "WALKING" ? g.maps.TravelMode.WALKING : g.maps.TravelMode.DRIVING;
+
+    const pts = stops.map((s) => ({ lat: s.lat, lng: s.lng }));
+    const destination = pts[pts.length - 1];
+    const waypoints = pts.slice(0, -1).map((p) => ({ location: p, stopover: true }));
+
+    ds.route(
+      {
+        origin: { lat: origin.lat, lng: origin.lng },
+        destination,
+        waypoints,
+        travelMode: mode,
+        optimizeWaypoints: false,
+      },
+      (result: any, status: string) => {
+        if (status === "OK" && result) {
+          dr.setDirections(result);
+        }
+      }
+    );
+
+    return () => {
+      try {
+        dr.setMap(null);
+      } catch {}
+    };
+  }, [loaded, ready, origin, travelMode, stops]);
 
   return (
     <div className="mt-4 overflow-hidden rounded-2xl border border-white/10 bg-black/20">
       <div className="flex items-center justify-between border-b border-white/10 px-4 py-3">
         <div className="text-sm font-semibold text-white/85">Map</div>
-        <div className="text-xs text-white/55">Stops: {stops.length}</div>
+        <div className="text-xs text-white/55">Stops: {stops.length}{origin ? " + you" : ""}</div>
       </div>
       {!ready ? (
-  <div className="flex h-[360px] w-full items-center justify-center text-sm text-white/55">
-    Loading map…
-  </div>
-) : null}
+        <div className="flex h-[360px] w-full items-center justify-center text-sm text-white/55">
+          Loading map…
+        </div>
+      ) : null}
 
-<div ref={mapDivRef} className={"w-full " + (ready ? "h-[360px]" : "h-0")} />
+      <div ref={mapDivRef} className={"w-full " + (ready ? "h-[360px]" : "h-0")} />
 
-  <Script
-    id="google-maps-js"
-    src={`https://maps.googleapis.com/maps/api/js?key=${apiKey}`}
-    strategy="afterInteractive"
-    onLoad={() => setLoaded(true)}
-  />
+      <Script
+        id="google-maps-js"
+        src={`https://maps.googleapis.com/maps/api/js?key=${apiKey}`}
+        strategy="afterInteractive"
+        onLoad={() => setLoaded(true)}
+      />
     </div>
   );
 }
@@ -264,6 +369,8 @@ export default function Home() {
 
   const [parkOnce, setParkOnce] = useState(false);
   const [showMap, setShowMap] = useState(true);
+  const [userLoc, setUserLoc] = useState<{ lat: number; lng: number } | null>(null);
+  const [locError, setLocError] = useState<string | null>(null);
 
   const mapsKey = process.env.NEXT_PUBLIC_GOOGLE_MAPS_API_KEY || "";
 
@@ -274,7 +381,36 @@ export default function Home() {
       .map((it) => ({ title: it.title, lat: it.lat as number, lng: it.lng as number }));
   }, [plan]);
 
+  const routeStops = useMemo(() => {
+    if (!plan) return [] as { lat: number; lng: number }[];
+    return plan.items
+      .filter((it) => it.type === "stop" && typeof it.lat === "number" && typeof it.lng === "number")
+      .map((it) => ({ lat: it.lat as number, lng: it.lng as number }));
+  }, [plan]);
+
   const cost = useMemo(() => (plan ? estimateCostRange(plan.items) : null), [plan]);
+
+  async function captureMyLocation() {
+    setLocError(null);
+    if (typeof window === "undefined" || !navigator?.geolocation) {
+      setLocError("Geolocation not available in this browser.");
+      return;
+    }
+
+    return new Promise<void>((resolve) => {
+      navigator.geolocation.getCurrentPosition(
+        (pos) => {
+          setUserLoc({ lat: pos.coords.latitude, lng: pos.coords.longitude });
+          resolve();
+        },
+        (err) => {
+          setLocError(err?.message || "Location permission denied.");
+          resolve();
+        },
+        { enableHighAccuracy: true, timeout: 10000, maximumAge: 60_000 }
+      );
+    });
+  }
 
   const onGenerate = async () => {
     const dest = destination.trim();
@@ -303,6 +439,7 @@ export default function Home() {
 
       const data = (await res.json()) as PlanResponse;
       setPlan(data);
+      void captureMyLocation();
     } catch (e) {
       const msg = e instanceof Error ? e.message : "Could not generate itinerary.";
       setError(msg);
@@ -365,7 +502,7 @@ export default function Home() {
 
       {/* hero */}
       <section className="mx-auto max-w-6xl px-4 pb-8 pt-10">
-        <div className="grid items-start gap-8 lg:grid-cols-2">
+        <div className="grid items-start gap-8">
           <div>
             <div className="inline-flex items-center gap-2 rounded-full border border-white/15 bg-white/5 px-3 py-1.5 text-xs text-white/80">
               <IconSparkle className="h-4 w-4" />
@@ -481,66 +618,62 @@ export default function Home() {
                   <IconArrow className="h-4 w-4 transition group-hover:translate-x-0.5" />
                 </button>
               </div>
-            </div>
-
-          </div>
-
-          {/* preview */}
-          <div className="lg:pt-2">
-            <div className="rounded-3xl border border-white/12 bg-white/5 p-5 shadow-[0_0_0_1px_rgba(255,255,255,0.06)] backdrop-blur">
-              <div className="flex items-start justify-between gap-3">
-                <div>
-                  <div className="text-xs text-white/60">Preview</div>
-                  <div className="mt-1 text-lg font-semibold">Your itinerary</div>
-                  <div className="mt-1 text-sm text-white/60">
-                    {plan ? (
-                      <>
-                        {plan.destination || "—"} • {plan.totalMinutes} min • {TRAVEL_STYLES.find((s) => s.key === style)?.label}
-                        {plan.items?.some((x) => x.type === "stop" && (x.photoUrl || x.rating || x.priceLevel || x.openNow !== undefined || x.reviewSnippet || x.parking)) ? (
-                          <span className="ml-2 rounded-full border border-emerald-400/30 bg-emerald-400/10 px-2 py-0.5 text-xs text-emerald-200">
-                            Enriched
-                          </span>
-                        ) : (
-                          <span className="ml-2 rounded-full border border-rose-400/30 bg-rose-400/10 px-2 py-0.5 text-xs text-rose-200">
-                            Basic
-                          </span>
-                        )}
-                        {cost ? (
-                          <span className="ml-2 rounded-full border border-white/15 bg-white/5 px-2 py-0.5 text-xs text-white/80">
-                            Est. ${cost.min}–${cost.max}
-                          </span>
-                        ) : null}
-                      </>
-                    ) : (
-                      "Generate to see your plan here"
-                    )}
-                  </div>
-                </div>
-                <button
-                  className="rounded-xl border border-white/15 bg-white/5 px-3 py-2 text-sm text-white/85 transition hover:bg-white/10 disabled:opacity-40"
-                  onClick={() => setShowMap((v) => !v)}
-                  disabled={!plan}
-                  type="button"
-                >
-                  {showMap ? "Hide map" : "Show map"}
-                </button>
-                <button
-                  className="rounded-xl border border-white/15 bg-white/5 px-3 py-2 text-sm text-white/85 transition hover:bg-white/10 disabled:opacity-40"
-                  onClick={() => setPlan(null)}
-                  disabled={!plan}
-                  type="button"
-                >
-                  Clear
-                </button>
-              </div>
 
               {plan ? (
                 <div className="mt-4">
+                  <div className="flex items-center justify-between">
+                    <div className="text-xs text-white/60">Map</div>
+                    <button
+                      className="rounded-xl border border-white/15 bg-white/5 px-3 py-2 text-sm text-white/85 transition hover:bg-white/10"
+                      onClick={() => setShowMap((v) => !v)}
+                      type="button"
+                    >
+                      {showMap ? "Hide" : "Show"}
+                    </button>
+                  </div>
+
+                  <div className="mt-2 flex items-center justify-between gap-2">
+                    <div className="text-xs text-white/55">
+                      {userLoc
+                        ? "Route starts from your current location"
+                        : "Tip: click ‘Use my location’ for better routes"}
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={() => void captureMyLocation()}
+                        className="rounded-xl border border-white/15 bg-white/5 px-3 py-2 text-sm text-white/85 transition hover:bg-white/10"
+                      >
+                        Use my location
+                      </button>
+
+                      <a
+                        href={buildGoogleMapsRouteUrl({
+                          origin: userLoc,
+                          stops: routeStops,
+                          travelMode: parkOnce ? "walking" : "driving",
+                        })}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="rounded-xl border border-white/15 bg-white/5 px-3 py-2 text-sm text-white/85 transition hover:bg-white/10"
+                      >
+                        Open full route
+                      </a>
+                    </div>
+                  </div>
+
+                  {locError ? <div className="mt-2 text-xs text-rose-200/90">{locError}</div> : null}
+
                   {showMap ? (
                     mapsKey ? (
-                      <MapView apiKey={mapsKey} stops={mapStops} />
+                      <MapView
+                        apiKey={mapsKey}
+                        stops={mapStops}
+                        origin={userLoc}
+                        travelMode={parkOnce ? "WALKING" : "DRIVING"}
+                      />
                     ) : (
-                      <div className="rounded-2xl border border-amber-400/20 bg-amber-400/10 p-4 text-sm text-amber-100">
+                      <div className="mt-3 rounded-2xl border border-amber-400/20 bg-amber-400/10 p-4 text-sm text-amber-100">
                         Map view needs <span className="font-semibold">NEXT_PUBLIC_GOOGLE_MAPS_API_KEY</span> in your env.
                         <div className="mt-1 text-xs text-amber-100/80">
                           Add it to <code>.env.local</code> and Vercel env vars, then restart.
@@ -548,7 +681,54 @@ export default function Home() {
                       </div>
                     )
                   ) : null}
+                </div>
+              ) : null}
+            </div>
 
+            {/* preview (moved below planner) */}
+            <div className="mt-8">
+              <div className="rounded-3xl border border-white/12 bg-white/5 p-5 shadow-[0_0_0_1px_rgba(255,255,255,0.06)] backdrop-blur">
+                <div className="flex items-start justify-between gap-3">
+                  <div>
+                    <div className="text-xs text-white/60">Preview</div>
+                    <div className="mt-1 text-lg font-semibold">Your itinerary</div>
+                    <div className="mt-1 text-sm text-white/60">
+                      {plan ? (
+                        <>
+                          {plan.destination || "—"} • {plan.totalMinutes} min • {TRAVEL_STYLES.find((s) => s.key === style)?.label}
+                          {plan.items?.some(
+                            (x) => x.type === "stop" && (x.photoUrl || x.rating || x.priceLevel || x.openNow !== undefined || x.reviewSnippet || x.parking)
+                          ) ? (
+                            <span className="ml-2 rounded-full border border-emerald-400/30 bg-emerald-400/10 px-2 py-0.5 text-xs text-emerald-200">
+                              Enriched
+                            </span>
+                          ) : (
+                            <span className="ml-2 rounded-full border border-rose-400/30 bg-rose-400/10 px-2 py-0.5 text-xs text-rose-200">
+                              Basic
+                            </span>
+                          )}
+                          {cost ? (
+                            <span className="ml-2 rounded-full border border-white/15 bg-white/5 px-2 py-0.5 text-xs text-white/80">
+                              Est. ${cost.min}–${cost.max}
+                            </span>
+                          ) : null}
+                        </>
+                      ) : (
+                        "Generate to see your plan here"
+                      )}
+                    </div>
+                  </div>
+                  <button
+                    className="rounded-xl border border-white/15 bg-white/5 px-3 py-2 text-sm text-white/85 transition hover:bg-white/10 disabled:opacity-40"
+                    onClick={() => setPlan(null)}
+                    disabled={!plan}
+                    type="button"
+                  >
+                    Clear
+                  </button>
+                </div>
+
+                {plan ? (
                   <div className="mt-4 grid gap-3">
                     {plan.items.map((it, idx) => (
                       <div
@@ -607,9 +787,13 @@ export default function Home() {
                                   </span>
                                 ) : null}
 
-                                {it.mapsUri ? (
+                                {typeof it.lat === "number" && typeof it.lng === "number" ? (
                                   <a
-                                    href={it.mapsUri}
+                                    href={buildGoogleMapsToStopUrl({
+                                      origin: userLoc,
+                                      destination: { lat: it.lat, lng: it.lng },
+                                      travelMode: plan?.parkOnce ? "walking" : "driving",
+                                    })}
                                     target="_blank"
                                     rel="noreferrer"
                                     className="rounded-full border border-white/15 bg-white/5 px-2 py-0.5 text-white/80 hover:bg-white/10"
@@ -648,44 +832,45 @@ export default function Home() {
                       </div>
                     ))}
                   </div>
-                </div>
-              ) : (
-                <div className="mt-6 rounded-2xl border border-white/12 bg-black/20 p-6">
-                  <div className="text-sm font-semibold">Try a sample</div>
-                  <div className="mt-1 text-sm text-white/65">
-                    Click <span className="text-white">Quick demo</span> in the top right.
+                ) : (
+                  <div className="mt-6 rounded-2xl border border-white/12 bg-black/20 p-6">
+                    <div className="text-sm font-semibold">Try a sample</div>
+                    <div className="mt-1 text-sm text-white/65">
+                      Click <span className="text-white">Quick demo</span> in the top right.
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              <div className="mt-4 grid gap-3 sm:grid-cols-2">
+                <div className="rounded-2xl border border-white/12 bg-white/5 p-4">
+                  <div className="text-sm font-semibold">How it works</div>
+                  <div className="mt-2 space-y-2 text-sm text-white/70">
+                    <div className="flex gap-2">
+                      <span className="grid h-6 w-6 place-items-center rounded-lg bg-white/10 text-xs ring-1 ring-white/10">1</span>
+                      <span>Destination + duration</span>
+                    </div>
+                    <div className="flex gap-2">
+                      <span className="grid h-6 w-6 place-items-center rounded-lg bg-white/10 text-xs ring-1 ring-white/10">2</span>
+                      <span>Pick your vibe</span>
+                    </div>
+                    <div className="flex gap-2">
+                      <span className="grid h-6 w-6 place-items-center rounded-lg bg-white/10 text-xs ring-1 ring-white/10">3</span>
+                      <span>Generate a 2–3 hour plan</span>
+                    </div>
                   </div>
                 </div>
-              )}
+                <div className="rounded-2xl border border-white/12 bg-white/5 p-4">
+                  <div className="text-sm font-semibold">Tips</div>
+                  <div className="mt-2 space-y-1 text-sm text-white/70">
+                    <div>• Use Park once for walkable areas.</div>
+                    <div>• Tap Maps to open directions.</div>
+                    <div>• Toggle Map to see pins.</div>
+                  </div>
+                </div>
+              </div>
             </div>
 
-            <div className="mt-4 grid gap-3 sm:grid-cols-2">
-              <div className="rounded-2xl border border-white/12 bg-white/5 p-4">
-                <div className="text-sm font-semibold">How it works</div>
-                <div className="mt-2 space-y-2 text-sm text-white/70">
-                  <div className="flex gap-2">
-                    <span className="grid h-6 w-6 place-items-center rounded-lg bg-white/10 text-xs ring-1 ring-white/10">1</span>
-                    <span>Destination + duration</span>
-                  </div>
-                  <div className="flex gap-2">
-                    <span className="grid h-6 w-6 place-items-center rounded-lg bg-white/10 text-xs ring-1 ring-white/10">2</span>
-                    <span>Pick your vibe</span>
-                  </div>
-                  <div className="flex gap-2">
-                    <span className="grid h-6 w-6 place-items-center rounded-lg bg-white/10 text-xs ring-1 ring-white/10">3</span>
-                    <span>Generate a 2–3 hour plan</span>
-                  </div>
-                </div>
-              </div>
-              <div className="rounded-2xl border border-white/12 bg-white/5 p-4">
-                <div className="text-sm font-semibold">Tips</div>
-                <div className="mt-2 space-y-1 text-sm text-white/70">
-                  <div>• Use Park once for walkable areas.</div>
-                  <div>• Tap Maps to open directions.</div>
-                  <div>• Toggle Map to see pins.</div>
-                </div>
-              </div>
-            </div>
           </div>
         </div>
       </section>
