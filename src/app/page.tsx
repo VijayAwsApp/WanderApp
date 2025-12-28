@@ -47,6 +47,8 @@ type ScheduledPlanItem = PlanItem & {
 const APP_NAME = "Wander App";
 
 type DurationKey = 120 | 150 | 180;
+type DurationMode = "hours" | "days";
+type DaysKey = 1 | 2;
 
 const TRAVEL_STYLES = [
   { key: "relaxed", label: "Relaxed" },
@@ -312,27 +314,27 @@ function ToggleRow(props: {
 }
 
 function MapView({
-  apiKey,
   stops,
   origin,
   travelMode,
+  ready,
 }: {
-  apiKey: string;
   stops: { title: string; lat: number; lng: number }[];
   origin?: { lat: number; lng: number } | null;
   travelMode?: "DRIVING" | "WALKING";
+  ready: boolean;
 }) {
   const mapDivRef = useRef<HTMLDivElement | null>(null);
   const mapRef = useRef<any>(null);
   const markersRef = useRef<any[]>([]);
   const directionsRef = useRef<any>(null);
-  const [loaded, setLoaded] = useState(false);
 
-  const ready =
-    loaded && typeof window !== "undefined" && (window as any).google?.maps;
+  // Remove local loaded state; use ready prop
+  const isReady =
+    ready && typeof window !== "undefined" && (window as any).google?.maps;
 
   useEffect(() => {
-    if (!ready) return;
+    if (!isReady) return;
     if (!mapDivRef.current) return;
     if (mapRef.current) return;
 
@@ -349,10 +351,10 @@ function MapView({
       fullscreenControl: false,
       streetViewControl: false,
     });
-  }, [loaded, ready, stops]);
+  }, [isReady, stops]);
 
   useEffect(() => {
-    if (!ready) return;
+    if (!isReady) return;
     if (!mapRef.current) return;
 
     markersRef.current.forEach((m) => m.setMap(null));
@@ -394,10 +396,10 @@ function MapView({
     });
 
     mapRef.current.fitBounds(bounds, 80);
-  }, [loaded, ready, stops, origin]);
+  }, [isReady, stops, origin]);
 
   useEffect(() => {
-    if (!ready || !mapRef.current) return;
+    if (!isReady || !mapRef.current) return;
     if (!stops || stops.length === 0) return;
 
     const g = (window as any).google;
@@ -457,7 +459,7 @@ function MapView({
         dr.setMap(null);
       } catch {}
     };
-  }, [loaded, ready, origin, travelMode, stops]);
+  }, [isReady, origin, travelMode, stops]);
 
   return (
     <div className="mt-4 overflow-hidden rounded-2xl border border-white/10 bg-black/20">
@@ -469,7 +471,7 @@ function MapView({
         </div>
       </div>
 
-      {!ready ? (
+      {!isReady ? (
         <div className="flex h-[360px] w-full items-center justify-center text-sm text-white/55">
           Loading map…
         </div>
@@ -477,14 +479,7 @@ function MapView({
 
       <div
         ref={mapDivRef}
-        className={"w-full " + (ready ? "h-[360px]" : "h-0")}
-      />
-
-      <Script
-        id="google-maps-js"
-        src={`https://maps.googleapis.com/maps/api/js?key=${apiKey}`}
-        strategy="afterInteractive"
-        onLoad={() => setLoaded(true)}
+        className={"w-full " + (isReady ? "h-[360px]" : "h-0")}
       />
     </div>
   );
@@ -492,13 +487,16 @@ function MapView({
 
 export default function Home() {
   const [destination, setDestination] = useState("");
-  const [style, setStyle] = useState<TravelStyleKey>("relaxed");
-  const [duration, setDuration] = useState<DurationKey>(150);
+  const [styles, setStyles] = useState<TravelStyleKey[]>(["relaxed"]);
+  const primaryStyle: TravelStyleKey = (styles[0] || "relaxed") as TravelStyleKey;
+  const [durationMode, setDurationMode] = useState<DurationMode>("hours");
+  const [duration, setDuration] = useState<DurationKey>(150); // hours-mode minutes
+  const [days, setDays] = useState<DaysKey>(1); // days-mode
   const [plan, setPlan] = useState<PlanResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
 
-  const [swappingIdx, setSwappingIdx] = useState<number | null>(null); // ✅ added
+  const [swappingIdx, setSwappingIdx] = useState<number | null>(null);
 
   const [parkOnce, setParkOnce] = useState(false);
   const [riderMode, setRiderMode] = useState(false);
@@ -514,6 +512,24 @@ export default function Home() {
   const [locError, setLocError] = useState<string | null>(null);
 
   const mapsKey = process.env.NEXT_PUBLIC_GOOGLE_MAPS_API_KEY || "";
+
+  // --- Google Maps/Places + autocomplete state ---
+  const [mapsLoaded, setMapsLoaded] = useState(false);
+  const mapsReady =
+    mapsLoaded && typeof window !== "undefined" && (window as any).google?.maps;
+
+  const [suggestions, setSuggestions] = useState<
+    { description: string; place_id: string }[]
+  >([]);
+  const [showSuggestions, setShowSuggestions] = useState(false);
+  const [activeSuggestionIdx, setActiveSuggestionIdx] = useState<number>(-1);
+  const [isLocating, setIsLocating] = useState(false);
+
+  const autocompleteSvcRef = useRef<any>(null);
+  const geocoderRef = useRef<any>(null);
+  const suggBoxRef = useRef<HTMLDivElement | null>(null);
+  const destInputRef = useRef<HTMLInputElement | null>(null);
+  const debounceRef = useRef<any>(null);
 
   const mapStops = useMemo(() => {
     if (!plan) return [] as { title: string; lat: number; lng: number }[];
@@ -593,6 +609,125 @@ export default function Home() {
     });
   }
 
+  // --- Google Maps initialization: Places/Autocomplete/Geocoder ---
+  useEffect(() => {
+    if (!mapsReady) return;
+    const g = (window as any).google;
+    try {
+      autocompleteSvcRef.current = new g.maps.places.AutocompleteService();
+      geocoderRef.current = new g.maps.Geocoder();
+    } catch {
+      autocompleteSvcRef.current = null;
+      geocoderRef.current = null;
+    }
+  }, [mapsReady]);
+
+  // --- Default destination to user's current location (reverse geocode) ---
+  useEffect(() => {
+    if (!mapsReady) return;
+    if (!userLoc) return;
+    if (destination.trim().length > 0) return;
+    if (!geocoderRef.current) return;
+
+    geocoderRef.current.geocode(
+      { location: { lat: userLoc.lat, lng: userLoc.lng } },
+      (results: any[], status: string) => {
+        if (status !== "OK" || !results?.length) return;
+
+        // Prefer a short, friendly locality label
+        const pick = (types: string[]) =>
+          results.find((r) => types.every((t) => r.types?.includes(t))) ||
+          results.find((r) => r.types?.includes(types[0]));
+
+        const locality = pick(["locality"]) || pick(["sublocality"]) || pick(["postal_town"]);
+        const admin = pick(["administrative_area_level_1"]);
+
+        const locName = locality?.address_components?.find((c: any) => c.types?.includes("locality"))?.long_name ||
+          locality?.address_components?.find((c: any) => c.types?.includes("sublocality"))?.long_name ||
+          locality?.formatted_address ||
+          results[0]?.formatted_address;
+
+        const region = admin?.address_components?.find((c: any) => c.types?.includes("administrative_area_level_1"))?.short_name;
+
+        const friendly = region ? `${locName}, ${region}` : String(locName || "");
+        if (friendly.trim()) setDestination(friendly);
+      }
+    );
+  }, [mapsReady, userLoc, destination]);
+
+  // --- Auto-capture location on first load so destination defaults automatically ---
+  useEffect(() => {
+    // Auto-detect on load for a better default experience
+    void (async () => {
+      if (userLoc) return;
+      setIsLocating(true);
+      await captureMyLocation();
+      setIsLocating(false);
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // --- Fetch Google Places Autocomplete suggestions ---
+  const fetchSuggestions = (q: string) => {
+    if (!mapsReady) return;
+    const svc = autocompleteSvcRef.current;
+    if (!svc) return;
+
+    if (debounceRef.current) clearTimeout(debounceRef.current);
+
+    const query = q.trim();
+    if (query.length < 2) {
+      setSuggestions([]);
+      return;
+    }
+
+    debounceRef.current = setTimeout(() => {
+      svc.getPlacePredictions(
+        {
+          input: query,
+          // Bias to the user's area if available
+          location:
+            userLoc && userLoc.lat != null && userLoc.lng != null
+              ? new (window as any).google.maps.LatLng(userLoc.lat, userLoc.lng)
+              : undefined,
+          radius: userLoc ? 40000 : undefined,
+        },
+        (preds: any[], status: string) => {
+          if (status !== "OK" || !Array.isArray(preds)) {
+            setSuggestions([]);
+            return;
+          }
+          const top = preds
+            .slice(0, 6)
+            .map((p) => ({ description: p.description, place_id: p.place_id }));
+          setSuggestions(top);
+        }
+      );
+    }, 160);
+  };
+
+  // --- Close suggestion dropdown on outside click ---
+  useEffect(() => {
+    const onDoc = (e: MouseEvent) => {
+      const t = e.target as Node;
+      if (suggBoxRef.current && suggBoxRef.current.contains(t)) return;
+      if (destInputRef.current && destInputRef.current.contains(t)) return;
+      setShowSuggestions(false);
+    };
+    document.addEventListener("mousedown", onDoc);
+    return () => document.removeEventListener("mousedown", onDoc);
+  }, []);
+
+  // Reset keyboard highlight when suggestions open/close
+  useEffect(() => {
+    if (!showSuggestions) setActiveSuggestionIdx(-1);
+  }, [showSuggestions]);
+
+  // Reset highlight when suggestion list changes
+  useEffect(() => {
+    setActiveSuggestionIdx(-1);
+  }, [suggestions]);
+
   const onGenerate = async () => {
     const dest = destination.trim();
 
@@ -611,8 +746,9 @@ export default function Home() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           destination: dest,
-          totalMinutes: duration,
-          vibe: style,
+          totalMinutes: durationMode === "days" ? days * 180 : duration,
+          vibe: primaryStyle,
+          vibes: styles,
           parkOnce,
           riderMode,
           bufferMinutes: addBuffer ? 10 : 0,
@@ -676,7 +812,8 @@ export default function Home() {
           action: "swap",
           destination: plan.destination,
           totalMinutes: plan.totalMinutes,
-          vibe: style,
+          vibe: primaryStyle,
+          vibes: styles,
           parkOnce,
           riderMode,
           bufferMinutes: addBuffer ? 10 : 0,
@@ -705,7 +842,7 @@ export default function Home() {
 
   const onQuickDemo = () => {
     setDestination("Vancouver");
-    setStyle("culture");
+    setStyles(["culture"]);
     setDuration(150);
     setError(null);
     setPlan(null);
@@ -734,7 +871,7 @@ export default function Home() {
             </div>
             <div className="leading-tight">
               <div className="text-sm font-semibold">{APP_NAME}</div>
-              <div className="text-xs text-white/60">2–3 hour itinerary builder</div>
+              <div className="text-xs text-white/60">Hours & multi-day itinerary builder</div>
             </div>
           </div>
 
@@ -769,7 +906,7 @@ export default function Home() {
               Build a
               <span className="bg-gradient-to-r from-fuchsia-300 via-sky-300 to-emerald-200 bg-clip-text text-transparent">
                 {" "}
-                2–3 hour
+                hours or days
               </span>{" "}
               itinerary
             </h1>
@@ -783,34 +920,164 @@ export default function Home() {
                 <div className="md:col-span-2">
                   <label className="text-xs text-white/60">Destination</label>
                   <input
+                    ref={destInputRef}
                     className="mt-1 w-full rounded-xl border border-white/15 bg-black/30 px-3 py-2 text-sm text-white placeholder:text-white/35 outline-none ring-0 transition focus:border-white/25"
-                    placeholder="e.g., Vancouver"
+                    placeholder={isLocating ? "Detecting your location…" : "e.g., Vancouver"}
                     value={destination}
-                    onChange={(e) => setDestination(e.target.value)}
+                    onChange={(e) => {
+                      const v = e.target.value;
+                      setDestination(v);
+                      setShowSuggestions(true);
+                      fetchSuggestions(v);
+                    }}
+                    onFocus={() => {
+                      const q = destination.trim();
+                      setShowSuggestions(true);
+                      if (q.length >= 2 && suggestions.length === 0) fetchSuggestions(q);
+                    }}
+                    onKeyDown={(e) => {
+                      if (!showSuggestions) return;
+                      if (suggestions.length === 0) return;
+
+                      if (e.key === "ArrowDown") {
+                        e.preventDefault();
+                        setActiveSuggestionIdx((i) => Math.min(i + 1, suggestions.length - 1));
+                      } else if (e.key === "ArrowUp") {
+                        e.preventDefault();
+                        setActiveSuggestionIdx((i) => Math.max(i - 1, 0));
+                      } else if (e.key === "Enter") {
+                        if (activeSuggestionIdx >= 0 && activeSuggestionIdx < suggestions.length) {
+                          e.preventDefault();
+                          const s = suggestions[activeSuggestionIdx];
+                          setDestination(s.description);
+                          setShowSuggestions(false);
+                          setSuggestions([]);
+                          setActiveSuggestionIdx(-1);
+                        }
+                      } else if (e.key === "Escape") {
+                        setShowSuggestions(false);
+                        setActiveSuggestionIdx(-1);
+                      }
+                    }}
                   />
+                  {showSuggestions && suggestions.length > 0 ? (
+                    <div
+                      ref={suggBoxRef}
+                      className="relative"
+                    >
+                      <div className="absolute left-0 right-0 z-30 mt-2 overflow-hidden rounded-2xl border border-white/12 bg-[#0B1020]/95 shadow-2xl backdrop-blur">
+                        {suggestions.map((s, idx) => (
+                          <button
+                            key={s.place_id}
+                            type="button"
+                            onClick={() => {
+                              setDestination(s.description);
+                              setShowSuggestions(false);
+                              setSuggestions([]);
+                              setActiveSuggestionIdx(-1);
+                            }}
+                            className={
+                              "w-full px-4 py-3 text-left text-sm transition " +
+                              (suggestions.findIndex((x) => x.place_id === s.place_id) === activeSuggestionIdx
+                                ? "bg-white/10 text-white"
+                                : "text-white/85 hover:bg-white/10")
+                            }
+                          >
+                            {s.description}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  ) : null}
+
+                  <div className="mt-2 text-[11px] text-white/45">
+                    {!mapsKey
+                      ? "Add NEXT_PUBLIC_GOOGLE_MAPS_API_KEY to enable location suggestions."
+                      : !mapsReady
+                      ? "Loading suggestions…"
+                      : userLoc
+                      ? "Using your location to improve suggestions."
+                      : "Tip: allow location for better suggestions."}
+                  </div>
                 </div>
 
                 <div>
-                  <label className="text-xs text-white/60">Duration</label>
-                  <div className="mt-1 grid grid-cols-3 gap-2">
-                    {([120, 150, 180] as const).map((m) => {
-                      const active = m === duration;
-                      return (
-                        <button
-                          key={m}
-                          type="button"
-                          onClick={() => setDuration(m)}
-                          className={
-                            "rounded-xl px-3 py-2 text-sm transition " +
-                            (active
-                              ? "bg-white text-black"
-                              : "border border-white/15 bg-white/5 text-white/85 hover:bg-white/10")
-                          }
-                        >
-                          {m === 120 ? "2h" : m === 150 ? "2.5h" : "3h"}
-                        </button>
-                      );
-                    })}
+                  <div className="flex items-center justify-between">
+                    <label className="text-xs text-white/60">Duration</label>
+                    <div className="flex items-center gap-1 rounded-full border border-white/12 bg-black/20 p-1">
+                      <button
+                        type="button"
+                        onClick={() => setDurationMode("hours")}
+                        className={
+                          "rounded-full px-2 py-1 text-[11px] font-semibold transition " +
+                          (durationMode === "hours"
+                            ? "bg-white text-black"
+                            : "text-white/70 hover:text-white")
+                        }
+                      >
+                        Hours
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setDurationMode("days")}
+                        className={
+                          "rounded-full px-2 py-1 text-[11px] font-semibold transition " +
+                          (durationMode === "days"
+                            ? "bg-white text-black"
+                            : "text-white/70 hover:text-white")
+                        }
+                      >
+                        Days
+                      </button>
+                    </div>
+                  </div>
+                  {durationMode === "hours" ? (
+                    <div className="mt-1 grid grid-cols-3 gap-2">
+                      {([120, 150, 180] as const).map((m) => {
+                        const active = m === duration;
+                        return (
+                          <button
+                            key={m}
+                            type="button"
+                            onClick={() => setDuration(m)}
+                            className={
+                              "rounded-xl px-3 py-2 text-sm transition " +
+                              (active
+                                ? "bg-white text-black"
+                                : "border border-white/15 bg-white/5 text-white/85 hover:bg-white/10")
+                            }
+                          >
+                            {m === 120 ? "2h" : m === 150 ? "2.5h" : "3h"}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  ) : (
+                    <div className="mt-1 grid grid-cols-2 gap-2">
+                      {([1, 2] as const).map((d) => {
+                        const active = d === days;
+                        return (
+                          <button
+                            key={d}
+                            type="button"
+                            onClick={() => setDays(d)}
+                            className={
+                              "rounded-xl px-3 py-2 text-sm transition " +
+                              (active
+                                ? "bg-white text-black"
+                                : "border border-white/15 bg-white/5 text-white/85 hover:bg-white/10")
+                            }
+                          >
+                            {d === 1 ? "1 day" : "2 days"}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  )}
+                  <div className="mt-2 text-[11px] text-white/45">
+                    {durationMode === "days"
+                      ? "Days mode generates a fuller plan (still optimized around a few key stops)."
+                      : "Pick a tight 2–3 hour plan."}
                   </div>
                 </div>
               </div>
@@ -818,16 +1085,23 @@ export default function Home() {
               <div className="mt-3">
                 <div className="flex items-center justify-between">
                   <div className="text-xs text-white/60">Vibe</div>
-                  <div className="text-xs text-white/45">Tap to switch</div>
+                  <div className="text-xs text-white/45">Pick one or more</div>
                 </div>
                 <div className="mt-2 flex flex-wrap gap-2">
                   {TRAVEL_STYLES.map((s) => {
-                    const isActive = s.key === style;
+                    const isActive = styles.includes(s.key);
                     return (
                       <button
                         key={s.key}
                         type="button"
-                        onClick={() => setStyle(s.key)}
+                        onClick={() => {
+                          setStyles((prev) => {
+                            const has = prev.includes(s.key);
+                            const next = has ? prev.filter((x) => x !== s.key) : [...prev, s.key];
+                            // never allow empty selection
+                            return (next.length ? next : ["relaxed"]) as TravelStyleKey[];
+                          });
+                        }}
                         className={
                           "rounded-full px-3 py-1.5 text-sm transition " +
                           (isActive
@@ -979,7 +1253,7 @@ export default function Home() {
                         onClick={() => void captureMyLocation()}
                         className="rounded-xl border border-white/15 bg-white/5 px-3 py-2 text-sm text-white/85 transition hover:bg-white/10"
                       >
-                        Use my location
+                        {isLocating ? "Locating…" : "Use my location"}
                       </button>
 
                       <a
@@ -1006,10 +1280,10 @@ export default function Home() {
                   {showMap ? (
                     mapsKey ? (
                       <MapView
-                        apiKey={mapsKey}
                         stops={mapStops}
                         origin={userLoc}
                         travelMode={parkOnce ? "WALKING" : "DRIVING"}
+                        ready={Boolean(mapsReady)}
                       />
                     ) : (
                       <div className="mt-3 rounded-2xl border border-amber-400/20 bg-amber-400/10 p-4 text-sm text-amber-100">
@@ -1036,7 +1310,12 @@ export default function Home() {
                       {plan ? (
                         <>
                           {plan.destination || "—"} • {plan.totalMinutes} min •{" "}
-                          {TRAVEL_STYLES.find((s) => s.key === style)?.label}
+                          {styles.length === 1
+                            ? TRAVEL_STYLES.find((s) => s.key === primaryStyle)?.label
+                            : styles
+                                .map((k) => TRAVEL_STYLES.find((s) => s.key === k)?.label)
+                                .filter(Boolean)
+                                .join(" + ")}
                           {plan.items?.some(
                             (x) =>
                               x.type === "stop" &&
@@ -1291,6 +1570,15 @@ export default function Home() {
           </div>
         </div>
       </footer>
+      {/* Global Google Maps/Places loader */}
+      {mapsKey ? (
+        <Script
+          id="google-maps-js"
+          src={`https://maps.googleapis.com/maps/api/js?key=${mapsKey}&libraries=places`}
+          strategy="beforeInteractive"
+          onLoad={() => setMapsLoaded(true)}
+        />
+      ) : null}
     </main>
   );
 }

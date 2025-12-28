@@ -169,13 +169,33 @@ function scoreCandidate(p: any, riderMode?: boolean) {
   return score * boost;
 }
 
-function desiredCategories(vibe: string, stopCount: number): ("attraction" | "food" | "park")[] {
-  if (stopCount === 2) return vibe === "foodie" ? ["food", "attraction"] : ["attraction", "food"];
+function vibeToQuery(vibe: string, destination: string) {
+  if (vibe === "adventure") return `top viewpoints parks trails in ${destination}`;
+  if (vibe === "foodie") return `best cafes restaurants bakeries in ${destination}`;
+  if (vibe === "relaxed") return `waterfront parks cafes in ${destination}`;
+  return `top tourist attractions museums in ${destination}`;
+}
 
-  if (vibe === "adventure") return ["park", "attraction", "food"];
-  if (vibe === "relaxed") return ["park", "food", "attraction"];
-  if (vibe === "foodie") return ["food", "attraction", "park"];
-  return ["attraction", "food", "park"];
+function desiredCategoriesMulti(
+  vibes: string[],
+  stopCount: number
+): ("attraction" | "food" | "park")[] {
+  const v = new Set((vibes || []).map((x) => String(x)));
+  const wants: ("attraction" | "food" | "park")[] = [];
+
+  // Always include at least one "attraction" to keep diversity.
+  wants.push("attraction");
+
+  if (v.has("foodie")) wants.push("food");
+  if (v.has("adventure") || v.has("relaxed")) wants.push("park");
+  if (v.has("culture")) wants.push("attraction");
+
+  // Fill remaining with a nice cycle
+  const cycle: ("attraction" | "food" | "park")[] = ["food", "park", "attraction"];
+  for (const c of cycle) if (!wants.includes(c)) wants.push(c);
+
+  // Trim to stopCount
+  return wants.slice(0, stopCount);
 }
 
 function orderByNearestNeighbor(list: any[], riderMode?: boolean) {
@@ -338,8 +358,11 @@ export async function POST(req: Request) {
     // -----------------------------
     if (action === "swap") {
       const destination = String(body?.destination ?? "").trim();
-      const totalMinutes = clamp(Number(body?.totalMinutes ?? 150), 120, 180);
+      const totalMinutes = clamp(Number(body?.totalMinutes ?? 150), 120, 420);
       const vibe = String(body?.vibe ?? "culture");
+      const vibes = Array.isArray(body?.vibes) ? (body.vibes as string[]).map((x) => String(x)) : [];
+      const vibesFinal = vibes.length ? vibes : [vibe];
+      const vibeLabel = vibesFinal.length > 1 ? "mixed" : vibesFinal[0];
       const parkOnce = Boolean(body?.parkOnce);
       const riderMode = Boolean(body?.riderMode);
       const bufferMinutes = clamp(Number(body?.bufferMinutes ?? 0), 0, 20);
@@ -428,9 +451,25 @@ export async function POST(req: Request) {
         .filter((p) => haversineKm(swapCenter, p.location) <= maxKm)
         .sort((a, b) => scoreCandidate(b, riderMode) - scoreCandidate(a, riderMode));
 
-      const replacement = filtered[0];
+      let replacement: any | undefined;
+
+      for (const cand of filtered.slice(0, 12)) {
+        const candId = String(cand?.id ?? "");
+        if (!candId) continue;
+        try {
+          const details = await getPlaceDetails(key, candId);
+          const openNow = details?.regularOpeningHours?.openNow;
+          // Skip explicitly closed places
+          if (openNow === false) continue;
+          replacement = cand;
+          break;
+        } catch {
+          // ignore and try next candidate
+        }
+      }
+
       if (!replacement?.id) {
-        return NextResponse.json({ error: "No replacement found nearby" }, { status: 404 });
+        return NextResponse.json({ error: "No OPEN replacement found nearby" }, { status: 404 });
       }
 
       // Replace only the swapped stop's placeId; keep durations exactly as provided
@@ -440,51 +479,60 @@ export async function POST(req: Request) {
         placeId: String(replacement.id),
       };
 
-      // Enrich all stops with place details (2–3 stops only)
-      const stops: StopDetails[] = await Promise.all(
-        nextStops.map(async (s: any) => {
-          const details = await getPlaceDetails(key, s.placeId);
+      // Enrich all stops with place details (2–3 stops only), sequentially,
+      // and reject if any stop is explicitly closed right now.
+      const stops: StopDetails[] = [];
 
-          let photoUrl: string | undefined;
-          const firstPhotoName = details?.photos?.[0]?.name;
-          if (firstPhotoName) {
-            photoUrl = await getPhotoUri(key, firstPhotoName, 1000);
-          }
+      for (const s of nextStops) {
+        const details = await getPlaceDetails(key, s.placeId);
 
-          const reviewSnippet = safeText(details?.reviews?.[0]?.text?.text, 170);
-          const openNow = details?.regularOpeningHours?.openNow;
-          const weekdayText = Array.isArray(details?.regularOpeningHours?.weekdayDescriptions)
-            ? (details.regularOpeningHours.weekdayDescriptions as string[])
-            : undefined;
+        const openNow = details?.regularOpeningHours?.openNow;
+        // If a stop is explicitly closed right now, don't include it.
+        if (openNow === false) {
+          return NextResponse.json(
+            { error: `One of the stops is closed right now (${details?.displayName?.text ?? "Place"}). Please regenerate.` },
+            { status: 404 }
+          );
+        }
 
-          let parking: ParkingOption | undefined;
-          try {
-            const base = await findParkingNear(key, details?.displayName?.text ?? "", destination);
-            parking = await enrichParkingMapsUri(key, base);
-          } catch {
-            parking = undefined;
-          }
+        let photoUrl: string | undefined;
+        const firstPhotoName = details?.photos?.[0]?.name;
+        if (firstPhotoName) {
+          photoUrl = await getPhotoUri(key, firstPhotoName, 1000);
+        }
 
-          return {
-            placeId: String(s.placeId),
-            title: details?.displayName?.text ?? s.title ?? "Place",
-            address: details?.formattedAddress,
-            lat: Number(details?.location?.latitude),
-            lng: Number(details?.location?.longitude),
-            mapsUri: details?.googleMapsUri,
+        const reviewSnippet = safeText(details?.reviews?.[0]?.text?.text, 170);
 
-            rating: typeof details?.rating === "number" ? details.rating : undefined,
-            userRatingCount:
-              typeof details?.userRatingCount === "number" ? details.userRatingCount : undefined,
-            priceLevel: typeof details?.priceLevel === "string" ? details.priceLevel : undefined,
-            openNow: typeof openNow === "boolean" ? openNow : undefined,
-            weekdayText,
-            photoUrl,
-            reviewSnippet,
-            parking,
-          } as StopDetails;
-        })
-      );
+        const weekdayText = Array.isArray(details?.regularOpeningHours?.weekdayDescriptions)
+          ? (details.regularOpeningHours.weekdayDescriptions as string[])
+          : undefined;
+
+        let parking: ParkingOption | undefined;
+        try {
+          const base = await findParkingNear(key, details?.displayName?.text ?? "", destination);
+          parking = await enrichParkingMapsUri(key, base);
+        } catch {
+          parking = undefined;
+        }
+
+        stops.push({
+          placeId: String(s.placeId),
+          title: details?.displayName?.text ?? s.title ?? "Place",
+          address: details?.formattedAddress,
+          lat: Number(details?.location?.latitude),
+          lng: Number(details?.location?.longitude),
+          mapsUri: details?.googleMapsUri,
+
+          rating: typeof details?.rating === "number" ? details.rating : undefined,
+          userRatingCount: typeof details?.userRatingCount === "number" ? details.userRatingCount : undefined,
+          priceLevel: typeof details?.priceLevel === "string" ? details.priceLevel : undefined,
+          openNow: typeof openNow === "boolean" ? openNow : undefined,
+          weekdayText,
+          photoUrl,
+          reviewSnippet,
+          parking,
+        } as StopDetails);
+      }
 
       // Park-once anchor parking near the FIRST stop
       let parkOnceLocation: ParkingOption | undefined;
@@ -605,7 +653,8 @@ export async function POST(req: Request) {
       return NextResponse.json({
         destination,
         totalMinutes,
-        vibe,
+        vibe: vibeLabel,
+        vibes: vibesFinal,
         parkOnce,
         riderMode,
         bufferMinutes,
@@ -619,11 +668,18 @@ export async function POST(req: Request) {
     // --------
 
     const destination = String(body?.destination ?? "").trim();
-    const totalMinutes = clamp(Number(body?.totalMinutes ?? 150), 120, 180);
+    const totalMinutes = clamp(Number(body?.totalMinutes ?? 150), 120, 420);
     const vibe = String(body?.vibe ?? "culture");
+    const vibes = Array.isArray(body?.vibes) ? (body.vibes as string[]).map((x) => String(x)) : [];
+    const vibesFinal = vibes.length ? vibes : [vibe];
+    const vibeLabel = vibesFinal.length > 1 ? "mixed" : vibesFinal[0];
     const parkOnce = Boolean(body?.parkOnce);
     const riderMode = Boolean(body?.riderMode);
     const bufferMinutes = clamp(Number(body?.bufferMinutes ?? 0), 0, 20);
+    const excludePlaceIds = Array.isArray(body?.excludePlaceIds)
+      ? (body.excludePlaceIds as string[])
+      : [];
+    const excludeSet = new Set(excludePlaceIds.map((x) => String(x)).filter(Boolean));
 
     if (!destination) {
       return NextResponse.json({ error: "Destination is required" }, { status: 400 });
@@ -637,14 +693,7 @@ export async function POST(req: Request) {
       );
     }
 
-    const query =
-      vibe === "adventure"
-        ? `top viewpoints parks trails in ${destination}`
-        : vibe === "foodie"
-        ? `best cafes restaurants bakeries in ${destination}`
-        : vibe === "relaxed"
-        ? `waterfront parks cafes in ${destination}`
-        : `top tourist attractions museums in ${destination}`;
+    const vibeQueries = vibesFinal.map((v) => vibeToQuery(v, destination));
 
     const destPlaces = await searchPlacesText(key, destination, 3);
     const destCenter = destPlaces?.[0]?.location as { latitude: number; longitude: number } | undefined;
@@ -655,14 +704,17 @@ export async function POST(req: Request) {
     const qScenic = `scenic viewpoints waterfront drives in ${destination}`;
     const qRideCoffee = `coffee stops with parking in ${destination}`;
 
-    const [candA, candF, candP, candVibe, candScenic, candRideCoffee] = await Promise.all([
+    const vibeResults = await Promise.all(vibeQueries.map((q) => searchPlacesText(key, q, 20)));
+
+    const [candA, candF, candP, candScenic, candRideCoffee] = await Promise.all([
       searchPlacesText(key, qAttraction, 20),
       searchPlacesText(key, qFood, 20),
       searchPlacesText(key, qPark, 20),
       searchPlacesText(key, qScenic, 20),
-      searchPlacesText(key, riderMode ? qScenic : qAttraction, 20),
       searchPlacesText(key, riderMode ? qRideCoffee : qFood, 20),
     ]);
+
+    const candVibe = vibeResults.flat();
 
     const byId = new Map<string, any>();
     for (const p of [...candA, ...candF, ...candP, ...candVibe, ...candScenic, ...candRideCoffee]) {
@@ -674,6 +726,7 @@ export async function POST(req: Request) {
     const radiusKm = 10;
 
     const filtered = pooled
+      .filter((p) => p?.id && !excludeSet.has(String(p.id)))
       .filter((p) => p?.id && p?.location?.latitude != null && p?.location?.longitude != null)
       .filter((p) => !isNoisyType(p?.types))
       .filter((p) => {
@@ -695,7 +748,7 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: "Not enough high-quality places found" }, { status: 404 });
     }
 
-    const want = desiredCategories(vibe, stopCount);
+    const want = desiredCategoriesMulti(vibesFinal, stopCount);
 
     const walkKmPrimary = 1.5;
     const walkKmRelaxed = 3;
@@ -765,60 +818,74 @@ export async function POST(req: Request) {
       ordered = [ordered[0], ...rest];
     }
 
-    const chosen = ordered.filter(Boolean).slice(0, stopCount);
+    const candidatesOrdered = ordered.filter(Boolean);
 
-    if (chosen.length < 2) {
-      return NextResponse.json({ error: "Not enough places found after filtering" }, { status: 404 });
+    const stops: StopDetails[] = [];
+    const usedIds = new Set<string>();
+
+    const maxAttempts = Math.min(candidatesOrdered.length, stopCount * 8);
+    let attempts = 0;
+
+    for (const p of candidatesOrdered) {
+      if (stops.length >= stopCount) break;
+      if (attempts >= maxAttempts) break;
+      attempts++;
+
+      const placeId = String(p?.id ?? "");
+      if (!placeId) continue;
+      if (usedIds.has(placeId)) continue;
+      usedIds.add(placeId);
+
+      const details = await getPlaceDetails(key, placeId);
+
+      // Skip places that are explicitly closed right now.
+      const openNow = details?.regularOpeningHours?.openNow;
+      if (openNow === false) {
+        continue;
+      }
+
+      let photoUrl: string | undefined;
+      const firstPhotoName = details?.photos?.[0]?.name;
+      if (firstPhotoName) {
+        photoUrl = await getPhotoUri(key, firstPhotoName, 1000);
+      }
+
+      const reviewSnippet = safeText(details?.reviews?.[0]?.text?.text, 170);
+
+      const weekdayText = Array.isArray(details?.regularOpeningHours?.weekdayDescriptions)
+        ? (details.regularOpeningHours.weekdayDescriptions as string[])
+        : undefined;
+
+      let parking: ParkingOption | undefined;
+      try {
+        const base = await findParkingNear(key, details?.displayName?.text ?? "", destination);
+        parking = await enrichParkingMapsUri(key, base);
+      } catch {
+        parking = undefined;
+      }
+
+      stops.push({
+        placeId,
+        title: details?.displayName?.text ?? "Place",
+        address: details?.formattedAddress,
+        lat: Number(details?.location?.latitude),
+        lng: Number(details?.location?.longitude),
+        mapsUri: details?.googleMapsUri,
+
+        rating: typeof details?.rating === "number" ? details.rating : undefined,
+        userRatingCount: typeof details?.userRatingCount === "number" ? details.userRatingCount : undefined,
+        priceLevel: typeof details?.priceLevel === "string" ? details.priceLevel : undefined,
+        openNow: typeof openNow === "boolean" ? openNow : undefined,
+        weekdayText,
+        photoUrl,
+        reviewSnippet,
+        parking,
+      });
     }
 
-    const stops: StopDetails[] = await Promise.all(
-      chosen.map(async (p) => {
-        const placeId = String(p?.id ?? "");
-        if (!placeId) throw new Error("Google Places returned an item without id");
-
-        const details = await getPlaceDetails(key, placeId);
-
-        let photoUrl: string | undefined;
-        const firstPhotoName = details?.photos?.[0]?.name;
-        if (firstPhotoName) {
-          photoUrl = await getPhotoUri(key, firstPhotoName, 1000);
-        }
-
-        const reviewSnippet = safeText(details?.reviews?.[0]?.text?.text, 170);
-
-        const openNow = details?.regularOpeningHours?.openNow;
-        const weekdayText = Array.isArray(details?.regularOpeningHours?.weekdayDescriptions)
-          ? (details.regularOpeningHours.weekdayDescriptions as string[])
-          : undefined;
-
-        let parking: ParkingOption | undefined;
-        try {
-          const base = await findParkingNear(key, details?.displayName?.text ?? "", destination);
-          parking = await enrichParkingMapsUri(key, base);
-        } catch {
-          parking = undefined;
-        }
-
-        return {
-          placeId,
-          title: details?.displayName?.text ?? "Place",
-          address: details?.formattedAddress,
-          lat: Number(details?.location?.latitude),
-          lng: Number(details?.location?.longitude),
-          mapsUri: details?.googleMapsUri,
-
-          rating: typeof details?.rating === "number" ? details.rating : undefined,
-          userRatingCount:
-            typeof details?.userRatingCount === "number" ? details.userRatingCount : undefined,
-          priceLevel: typeof details?.priceLevel === "string" ? details.priceLevel : undefined,
-          openNow: typeof openNow === "boolean" ? openNow : undefined,
-          weekdayText,
-          photoUrl,
-          reviewSnippet,
-          parking,
-        };
-      })
-    );
+    if (stops.length < 2) {
+      return NextResponse.json({ error: "Not enough OPEN places found right now" }, { status: 404 });
+    }
 
     let parkOnceLocation: ParkingOption | undefined;
     if (parkOnce && stops.length > 0) {
@@ -937,7 +1004,8 @@ export async function POST(req: Request) {
     return NextResponse.json({
       destination,
       totalMinutes,
-      vibe,
+      vibe: vibeLabel,
+      vibes: vibesFinal,
       parkOnce,
       riderMode,
       bufferMinutes,
